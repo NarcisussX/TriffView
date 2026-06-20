@@ -1,0 +1,53 @@
+# Local project state
+/STATE.md
+
+# Web app dependencies and build output
+/app/node_modules/
+/app/dist/
+/app/.vite/
+/app/.vite-inspect/
+/app/*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Native build output
+/native/bin/
+/native/obj/
+/native/Assets/overlay-dist.zip
+*.user
+*.suo
+*.rsuser
+
+# Release and verification artifacts
+/artifacts/
+/release/
+
+# Local .NET/NuGet caches
+/.dotnet/
+/.dotnet-home/
+/.nuget/
+/.appdata/
+/.nuget-cache/
+/.nuget-plugin-cache/
+
+# IDE/editor state
+/.vs/
+/.vscode/
+/.idea/
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Logs, temp files, and OS cruft
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+Thumbs.db
+Desktop.ini
+.DS_Store
