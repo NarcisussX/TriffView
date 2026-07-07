@@ -610,6 +610,59 @@
   color: var(--tv-text-active);
 }
 
+.triffview-standalone-topbar > .triffview-update-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 390px;
+  margin-left: auto;
+  margin-right: 8px;
+  padding: 4px 5px 4px 9px;
+  border: 1px solid var(--tv-warning-border);
+  background: rgba(var(--tv-surface-rgb), 0.96);
+  box-shadow: inset 2px 0 0 var(--tv-warning);
+}
+
+.triffview-standalone-topbar .triffview-update-copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--tv-text);
+  white-space: nowrap;
+}
+
+.triffview-standalone-topbar .triffview-update-copy strong {
+  color: var(--tv-warning);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.triffview-standalone-topbar .triffview-update-copy em {
+  overflow: hidden;
+  max-width: 96px;
+  color: var(--tv-text-muted);
+  font-style: normal;
+  text-overflow: ellipsis;
+}
+
+.triffview-standalone-topbar .triffview-update-pill button {
+  min-width: 0;
+  min-height: 22px;
+  padding: 0 8px;
+  border-color: var(--tv-border);
+  background: var(--tv-control-bg);
+  color: var(--tv-text);
+  font-size: 11px;
+}
+
+.triffview-standalone-topbar .triffview-update-pill button:hover {
+  border-color: var(--tv-warning);
+  background: var(--tv-warning-bg);
+  color: var(--tv-white);
+}
+
 .triffview-standalone-panel {
   min-height: 0;
   overflow: hidden;
@@ -3552,4 +3605,420 @@ button:disabled {
 .triffview-gesture-control button,
 .triffview-hotkey-modal button {
   min-height: 34px;
+}
+
+.trifffleets .triffview-section-content {
+  gap: 14px;
+}
+
+.trifffleets-stack {
+  display: grid;
+  gap: 12px;
+}
+
+.trifffleets-error {
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+}
+
+.trifffleets-error button {
+  min-height: 28px;
+}
+
+.trifffleets-auth-band .triffview-band-top {
+  align-items: center;
+}
+
+.trifffleets-scope-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.trifffleets-scope-list span {
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  color: var(--tv-accent-text);
+  padding: 5px 8px;
+  font-weight: 700;
+}
+
+.trifffleets-two-col {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.trifffleets-readonly {
+  min-height: 34px;
+  border: 1px solid var(--tv-border);
+  background: var(--tv-bg);
+  color: var(--tv-text);
+  padding: 8px 10px;
+  font-weight: 700;
+}
+
+.trifffleets-actions-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+}
+
+.trifffleets-actions-row button,
+.trifffleets button {
+  min-height: 31px;
+}
+
+.trifffleets .trifffleets-actions-row button {
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  color: var(--tv-text-strong);
+  padding: 6px 10px;
+  border-radius: 0;
+  font-weight: 800;
+}
+
+.trifffleets .trifffleets-actions-row button:hover:not(:disabled),
+.trifffleets .trifffleets-actions-row button:focus-visible:not(:disabled) {
+  border-color: var(--tv-accent);
+  background: rgba(var(--tv-accent-rgb), 0.14);
+  color: var(--tv-text-strong);
+}
+
+.trifffleets .trifffleets-actions-row button:disabled {
+  opacity: 0.42;
+}
+
+.trifffleets-profile-actions {
+  justify-content: flex-start;
+  align-self: end;
+  padding-bottom: 1px;
+}
+
+.trifffleets-editor-actions {
+  margin-top: 2px;
+}
+
+.trifffleets-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.trifffleets-stat-grid > div {
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  padding: 10px;
+}
+
+.trifffleets-stat-grid span {
+  display: block;
+  color: var(--tv-muted);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.trifffleets-stat-grid strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--tv-text-strong);
+  font-size: 15px;
+}
+
+.trifffleets-profile-head {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.trifffleets-toggle-row {
+  display: inline-flex;
+  width: fit-content;
+  max-width: 100%;
+  align-items: center;
+  gap: 9px;
+  min-height: 34px;
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  color: var(--tv-text);
+  padding: 7px 10px;
+  font-weight: 700;
+}
+
+.trifffleets .trifffleets-toggle-row input {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  min-height: 14px;
+  margin: 0;
+  padding: 0;
+  accent-color: var(--tv-accent);
+}
+
+.trifffleets-tree {
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--tv-border);
+  background:
+    linear-gradient(180deg, rgba(var(--tv-panel-rgb), 0.48), rgba(var(--tv-bg-rgb), 0.94)),
+    radial-gradient(circle at 16% 0%, rgba(var(--tv-accent-rgb), 0.12), transparent 38%);
+  padding: 7px;
+}
+
+.trifffleets-tree-head {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  gap: 6px;
+  align-items: center;
+}
+
+.trifffleets-wing {
+  display: grid;
+  gap: 4px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.trifffleets-squad {
+  display: grid;
+  gap: 4px;
+  margin-left: 22px;
+  border: 0;
+  border-left: 1px solid rgba(var(--tv-accent-rgb), 0.28);
+  background: transparent;
+  padding: 0 0 0 9px;
+}
+
+.trifffleets-members {
+  display: grid;
+  gap: 3px;
+  margin-left: 22px;
+}
+
+.trifffleets-member-row {
+  display: grid;
+  grid-template-columns: 10px minmax(180px, 1fr) minmax(150px, 210px) auto;
+  gap: 5px;
+  align-items: center;
+  min-height: 30px;
+  border: 1px solid var(--tv-border-muted);
+  background: rgba(var(--tv-panel-rgb), 0.45);
+  padding: 3px 5px;
+}
+
+.trifffleets-wing-head,
+.trifffleets-squad-head {
+  min-height: 34px;
+  border: 1px solid var(--tv-border);
+  background: rgba(var(--tv-panel-rgb), 0.68);
+  padding: 4px 6px;
+}
+
+.trifffleets-wing-head {
+  background: linear-gradient(90deg, rgba(var(--tv-accent-rgb), 0.16), rgba(var(--tv-panel-rgb), 0.68));
+}
+
+.trifffleets-squad-head {
+  background: rgba(var(--tv-panel-rgb), 0.54);
+}
+
+.trifffleets-node-caret {
+  width: 0;
+  height: 0;
+  border-left: 5px solid var(--tv-text);
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  opacity: 0.74;
+}
+
+.trifffleets-member-rail {
+  width: 8px;
+  height: 1px;
+  background: rgba(var(--tv-accent-rgb), 0.56);
+}
+
+.trifffleets-tree .triffview-field {
+  gap: 3px;
+}
+
+.trifffleets-field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.trifffleets-field-label-row span {
+  color: var(--tv-muted);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.trifffleets-tree .triffview-field label {
+  color: var(--tv-muted);
+  font-size: 11px;
+}
+
+.trifffleets-tree .triffview-field input,
+.trifffleets-tree .trifffleets-member-row input,
+.trifffleets-tree .trifffleets-member-row select {
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.trifffleets-tree .trifffleets-actions-row {
+  flex-wrap: nowrap;
+  gap: 5px;
+}
+
+.trifffleets-tree .trifffleets-actions-row button,
+.trifffleets-tree .trifffleets-member-row button {
+  min-height: 28px;
+  padding: 4px 8px;
+}
+
+.trifffleets-plan {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.trifffleets-plan-box {
+  min-height: 82px;
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  padding: 10px;
+}
+
+.trifffleets-plan-box h3 {
+  margin: 0 0 8px;
+  color: var(--tv-text-strong);
+  font-size: 15px;
+}
+
+.trifffleets-plan-box p {
+  margin: 4px 0;
+  color: var(--tv-text);
+  font-size: 13px;
+}
+
+.trifffleets-plan-box .is-muted {
+  color: var(--tv-muted);
+}
+
+.trifffleets-plan-box.is-danger {
+  border-color: var(--tv-danger-border);
+  background: rgba(var(--tv-danger-bg-rgb), 0.16);
+}
+
+.trifffleets-plan-box.is-danger h3,
+.trifffleets-plan-box.is-danger p {
+  color: var(--tv-danger-text);
+}
+
+.trifffleets-plan-box.is-warning {
+  border-color: var(--tv-warning-border);
+  background: var(--tv-warning-bg);
+}
+
+.trifffleets-plan-box.is-warning h3,
+.trifffleets-plan-box.is-warning p {
+  color: var(--tv-warning-text);
+}
+
+.trifffleets-result-list {
+  display: grid;
+  gap: 6px;
+}
+
+.trifffleets-result-row {
+  display: grid;
+  grid-template-columns: 90px minmax(160px, 1fr) 150px minmax(220px, 1.4fr);
+  gap: 8px;
+  align-items: center;
+  border: 1px solid var(--tv-border);
+  background: var(--tv-control-bg-alt);
+  padding: 8px 10px;
+}
+
+.trifffleets-result-row span {
+  color: var(--tv-muted);
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.trifffleets-result-row strong {
+  color: var(--tv-text-strong);
+}
+
+.trifffleets-result-row em {
+  color: var(--tv-text);
+  font-style: normal;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.trifffleets-result-row em.is-success {
+  color: var(--tv-success-text);
+}
+
+.trifffleets-result-row em.is-warning {
+  color: var(--tv-warning-text);
+}
+
+.trifffleets-result-row em.is-danger {
+  color: var(--tv-danger-text);
+}
+
+.trifffleets-result-row p {
+  margin: 0;
+  color: var(--tv-muted);
+}
+
+.trifffleets :is(input, textarea, select) {
+  width: 100%;
+  min-height: 34px;
+  border: 1px solid var(--tv-border);
+  background: var(--tv-bg);
+  color: var(--tv-text);
+  padding: 6px 9px;
+  font: inherit;
+  font-weight: 700;
+}
+
+.trifffleets select option,
+.trifffleets select optgroup {
+  background: var(--tv-bg);
+  color: var(--tv-text);
+}
+
+.trifffleets :is(input, textarea, select):focus {
+  border-color: var(--tv-accent);
+  outline: 1px solid rgba(var(--tv-accent-rgb), 0.7);
+  outline-offset: -1px;
+}
+
+.trifffleets :is(input, textarea)::selection {
+  background: rgba(var(--tv-accent-rgb), 0.32);
+  color: var(--tv-selection-text);
+}
+
+@media (max-width: 980px) {
+  .trifffleets-two-col,
+  .trifffleets-profile-head,
+  .trifffleets-tree-head,
+  .trifffleets-plan {
+    grid-template-columns: 1fr;
+  }
+
+  .trifffleets-stat-grid,
+  .trifffleets-result-row,
+  .trifffleets-member-row {
+    grid-template-columns: 1fr;
+  }
 }

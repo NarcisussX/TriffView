@@ -1,14 +1,14 @@
 # TriffView
 
-Fast EVE client previews and EVE Settings management in one standalone app.
+Fast EVE client previews, EVE Settings management, and ESI fleet setup in one standalone app.
 
-TriffView is built for EVE Online multiboxers who want the best parts of preview switching, profile management, and EVE Settings copying without needing multiple programs. It gives you live client previews, rapid character switching, persistent layouts, imported EVE-O/EVE-X profiles for a fast transition, and EVE Settings backup/copy tools in a focused desktop app that is designed to stay light.
+TriffView is built for EVE Online multiboxers who want the best parts of preview switching, profile management, EVE Settings copying, and fleet setup assistance without needing multiple programs. It gives you live client previews, rapid character switching, persistent layouts, imported EVE-O/EVE-X profiles for a fast transition, EVE Settings backup/copy tools, and an ESI-only Fleet Manager in a focused desktop app that is designed to stay light.
 
 ## Why It Exists
 
 Multiboxing should feel immediate. Your preview windows should be where you left them, your hotkeys should follow your characters, and your multiboxing program should not use more resources than your clients.
 
-TriffView is a standalone preview system paired with a custom EVE Settings management application. One app that can manage both how you switch between clients and how your EVE character settings move between profiles, accounts, backups, and fresh installs.
+TriffView is a standalone preview system paired with a custom EVE Settings management application and a fleet layout assistant. One app that can manage how you switch between clients, how your EVE character settings move between profiles/accounts/backups/fresh installs, and how saved fleet layouts become live ESI fleet invites.
 
 ## Highlights
 
@@ -23,12 +23,21 @@ TriffView is a standalone preview system paired with a custom EVE Settings manag
 - EVE-O Preview JSON import.
 - EVE-X Preview JSON import.
 - Full TriffView settings backup export and restore.
+- Fleet Manager for saving wing/squad layouts, pre-assigning characters, restructuring live fleets, moving existing members, and sending ESI invites.
 - Dark themed standalone settings window with selectable GUI themes.
 - Tray controls for quick enable, disable, suspend, save, restore, reload, and quit actions.
 
 ## EVE Settings Included
 
 Use it to manage EVE profile and character settings, copy settings, overviews, window positions and layouts between characters, preserve backups, and recover working layouts without digging through EVE's settings folders by hand. For players running multiple accounts or rebuilding setups often, this lets you reload your layouts quickly, and repeatably. 
+
+## Fleet Manager Included
+
+TriffFleets lets you save fleet wing/squad names, pre-assign characters and roles, then hit Apply to restructure your current fleet and invite or move pilots into the correct squads through official EVE SSO and ESI.
+
+Build repeatable fleet templates for DPS, logi, scouts, miners, rolling crews, or whatever your multiboxing setup needs. Create the fleet in-game, detect it with the authenticated fleet boss, then let TriffFleets create or rename wings and squads, move existing members into their saved positions, invite missing characters, keep unexpected pilots in a Bench / Waiting squad, and show a clear result log for every action.
+
+Fleet Manager does not control EVE clients. It does not inject keyboard input, mouse input, chat commands, OCR, memory reads, warps, modules, or invite acceptance. Characters still accept fleet invites manually in-game.
 
 ## Low Resource By Design
 
@@ -48,7 +57,7 @@ TriffView can import EVE-O Preview and EVE-X Preview JSON settings, then turn th
 
 ## Built For EVE Multiboxers
 
-It does not broadcast input, read game memory, inject into the EVE client, or hook client rendering. It focuses on the things a preview tool should do well: show clients, switch clients, remember layouts, manage settings, and get out of your way.
+It does not broadcast input, forward input, read game memory, inject into the EVE client, or hook client rendering. It focuses on the things a preview tool should do well: show clients, switch clients, remember layouts, manage settings, assist with ESI fleet invites, and get out of your way.
 
 ## Project Notes
 

@@ -17,6 +17,7 @@ internal sealed class TriffViewController : IDisposable
     private readonly Dispatcher _dispatcher;
     private readonly Action<object> _postToHud;
     private readonly Action _reassertHudTopmost;
+    private readonly Action<bool> _applySettingsAlwaysOnTop;
     private readonly EveWindowTracker _tracker = new();
     private readonly DispatcherTimer _timer;
     private readonly TriffViewOverlayForm _overlay;
@@ -32,11 +33,12 @@ internal sealed class TriffViewController : IDisposable
     public TriffViewSettings Settings { get; }
     public bool SettingsPanelOpen => _settingsPanelOpen;
 
-    public TriffViewController(Dispatcher dispatcher, Action<object> postToHud, Action reassertHudTopmost)
+    public TriffViewController(Dispatcher dispatcher, Action<object> postToHud, Action reassertHudTopmost, Action<bool> applySettingsAlwaysOnTop)
     {
         _dispatcher = dispatcher;
         _postToHud = postToHud;
         _reassertHudTopmost = reassertHudTopmost;
+        _applySettingsAlwaysOnTop = applySettingsAlwaysOnTop;
         Settings = TriffViewSettings.Load();
         _overlay = new TriffViewOverlayForm();
         _overlay.ActivateRequested += ActivateClient;
@@ -53,6 +55,8 @@ internal sealed class TriffViewController : IDisposable
 
     public void Start()
     {
+        _applySettingsAlwaysOnTop(Settings.SettingsWindowAlwaysOnTop);
+
         if (Settings.Enabled)
         {
             _overlay.SizeToVirtualDesktop();
@@ -78,6 +82,9 @@ internal sealed class TriffViewController : IDisposable
                 return true;
             case "triffview:set-settings-open":
                 SetSettingsPanelOpen(message?["open"]?.GetValue<bool>() == true);
+                return true;
+            case "triffview:set-settings-window-always-on-top":
+                SetSettingsWindowAlwaysOnTop(message?["alwaysOnTop"]?.GetValue<bool>() != false);
                 return true;
             case "triffview:set-guide-completed":
                 SetGuideCompleted(message?["completed"]?.GetValue<bool>() == true);
@@ -172,6 +179,21 @@ internal sealed class TriffViewController : IDisposable
         _settingsPanelOpen = open;
         ApplyTopmostPolicy(force: true);
         _reassertHudTopmost();
+    }
+
+    private void SetSettingsWindowAlwaysOnTop(bool alwaysOnTop)
+    {
+        if (Settings.SettingsWindowAlwaysOnTop == alwaysOnTop)
+        {
+            _applySettingsAlwaysOnTop(alwaysOnTop);
+            PostState();
+            return;
+        }
+
+        Settings.SettingsWindowAlwaysOnTop = alwaysOnTop;
+        Settings.Save();
+        _applySettingsAlwaysOnTop(alwaysOnTop);
+        PostState(force: true);
     }
 
     private void SetGuideCompleted(bool completed)
@@ -1403,6 +1425,7 @@ internal sealed class TriffViewController : IDisposable
             type = "triffview:state",
             enabled = Settings.Enabled,
             hotkeysSuspended = Settings.HotkeysSuspended,
+            settingsWindowAlwaysOnTop = Settings.SettingsWindowAlwaysOnTop,
             guideCompleted = Settings.GuideCompleted,
             guideVersion = Settings.GuideVersion,
             selectedProfileId = Settings.SelectedProfileId,
@@ -2608,6 +2631,7 @@ internal sealed class TriffViewSettings
 
     public bool Enabled { get; set; }
     public bool HotkeysSuspended { get; set; }
+    public bool SettingsWindowAlwaysOnTop { get; set; } = true;
     public bool GuideCompleted { get; set; }
     public string GuideVersion { get; set; } = "";
     public string SelectedProfileId { get; set; } = "default";

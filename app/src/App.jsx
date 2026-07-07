@@ -1,12 +1,14 @@
 import React, { Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { onNativeMessage, postNative } from "./nativeBridge.js";
+import { onNativeMessage, openExternalUrl, postNative } from "./nativeBridge.js";
 import TriffViewSettings from "./tools/TriffViewSettings.jsx";
 
 const EveSettings = React.lazy(() => import("./tools/EveSettings.tsx"));
+const TriffFleets = React.lazy(() => import("./tools/TriffFleets.tsx"));
 
 const NAV_ITEMS = [
   { id: "triffview", label: "TriffView" },
   { id: "eve-settings", label: "EVE Settings" },
+  { id: "fleet-manager", label: "Fleet Manager" },
 ];
 const THEME_STORAGE_KEY = "triffview.guiTheme";
 const GUI_THEMES = [
@@ -69,11 +71,47 @@ function publishInputRegions() {
   postNative({ type: "input-regions", regions });
 }
 
+function UpdateNotice({ update, onDismiss, onIgnore }) {
+  if (!update?.updateAvailable || update.ignored) return null;
+
+  const versionLabel = update.latestTag || `v${update.latestVersion}`;
+  const openUpdate = () => {
+    if (!postNative({ type: "update:open" })) {
+      openExternalUrl(update.releaseUrl || "https://github.com/NarcisussX/TriffView/releases");
+    }
+  };
+
+  return (
+    <div className="triffview-update-pill" data-hud-input-region="update">
+      <span className="triffview-update-copy">
+        <strong>Update available</strong>
+        <em>{versionLabel}</em>
+      </span>
+      <button type="button" onClick={openUpdate}>
+        Open
+      </button>
+      <button type="button" onClick={onDismiss}>
+        Later
+      </button>
+      <button type="button" onClick={onIgnore}>
+        Ignore
+      </button>
+    </div>
+  );
+}
+
 export default function App() {
   const [activeTool, setActiveTool] = useState("triffview");
   const [themeId, setThemeId] = useState(readSavedTheme);
+  const [updateInfo, setUpdateInfo] = useState(null);
+  const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState("");
   const rootRef = useRef(null);
   const activeTheme = GUI_THEMES.find((theme) => theme.id === themeId) || GUI_THEMES[0];
+  const showUpdateNotice =
+    updateInfo?.updateAvailable &&
+    !updateInfo?.ignored &&
+    updateInfo.latestVersion &&
+    dismissedUpdateVersion !== updateInfo.latestVersion;
 
   useEffect(() => {
     if (activeTheme.id !== themeId) {
@@ -88,6 +126,8 @@ export default function App() {
         if (NAV_ITEMS.some((item) => item.id === tool)) {
           setActiveTool(tool);
         }
+      } else if (message?.type === "update-state") {
+        setUpdateInfo(message.update || null);
       }
     });
 
@@ -127,7 +167,7 @@ export default function App() {
       <header className="triffview-standalone-topbar" data-hud-input-region="topbar">
         <div className="triffview-brand-block">
           <strong>TriffView</strong>
-          <span>Previews and EVE settings</span>
+          <span>Previews, fleets, and EVE settings</span>
           <label className="triffview-theme-picker">
             <span className="triffview-theme-swatches" aria-hidden="true">
               {activeTheme.swatches.map((color) => (
@@ -148,6 +188,16 @@ export default function App() {
             </select>
           </label>
         </div>
+        {showUpdateNotice ? (
+          <UpdateNotice
+            update={updateInfo}
+            onDismiss={() => setDismissedUpdateVersion(updateInfo.latestVersion)}
+            onIgnore={() => {
+              postNative({ type: "update:ignore-version", version: updateInfo.latestVersion });
+              setDismissedUpdateVersion(updateInfo.latestVersion);
+            }}
+          />
+        ) : null}
         <nav aria-label="Standalone tool navigation">
           {NAV_ITEMS.map((item) => (
             <button
@@ -167,6 +217,11 @@ export default function App() {
         {activeTool === "eve-settings" ? (
           <Suspense fallback={<div className="triffview-standalone-loading">Loading EVE Settings...</div>}>
             <EveSettings />
+          </Suspense>
+        ) : null}
+        {activeTool === "fleet-manager" ? (
+          <Suspense fallback={<div className="triffview-standalone-loading">Loading Fleet Manager...</div>}>
+            <TriffFleets />
           </Suspense>
         ) : null}
       </section>

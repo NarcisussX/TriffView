@@ -5,6 +5,7 @@ import { clearHudTextFocus, onNativeMessage, postNative } from "../nativeBridge.
 const EMPTY_STATE = {
   enabled: false,
   hotkeysSuspended: false,
+  settingsWindowAlwaysOnTop: true,
   guideCompleted: true,
   guideVersion: "",
   selectedProfileId: "default",
@@ -1273,6 +1274,17 @@ function TriffViewSettings({ open = true }) {
                 Restore backup and overwrite all
               </button>
             </div>
+          </div>
+          <div className="triffview-profile-create">
+            <div className="triffview-backup-note">
+              <strong>Settings window</strong>
+              <span>This affects only the TriffView settings window. Preview windows keep their own topmost behavior.</span>
+            </div>
+            <Toggle
+              label="Keep TriffView settings always on top"
+              checked={state.settingsWindowAlwaysOnTop !== false}
+              onChange={(value) => send("triffview:set-settings-window-always-on-top", { alwaysOnTop: value })}
+            />
           </div>
         </div>
         ) : null}

@@ -10,6 +10,7 @@ using System.Windows;
 using Microsoft.Web.WebView2.Core;
 using TriffView.EveSettings;
 using TriffView.Preview;
+using TriffView.TriffFleets;
 using Drawing = System.Drawing;
 using Forms = System.Windows.Forms;
 using Media = System.Windows.Media;
@@ -105,7 +106,12 @@ public partial class MainWindow : Window
 {
     private const string VirtualHostName = "app.triffview.local";
     private const string EmbeddedOverlayResourceName = "TriffView.Assets.overlay-dist.zip";
+    private static readonly JsonSerializerOptions WebMessageJsonOptions = new()
+    {
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
+    };
     private static readonly nint HwndTopmost = new(-1);
+    private static readonly nint HwndNotTopmost = new(-2);
     private const uint SwpNoSize = 0x0001;
     private const uint SwpNoMove = 0x0002;
     private const uint SwpNoActivate = 0x0010;
@@ -117,6 +123,7 @@ public partial class MainWindow : Window
     private const int DwmwaTextColor = 36;
 
     private readonly string[] _args;
+    private readonly TriffViewUpdateChecker _updateChecker;
     private readonly System.Windows.Threading.DispatcherTimer _conflictTimer;
     private Forms.NotifyIcon? _trayIcon;
     private Forms.ContextMenuStrip? _trayMenu;
@@ -126,14 +133,21 @@ public partial class MainWindow : Window
     private Forms.ToolStripMenuItem? _triffViewHotkeysItem;
     private TriffViewController? _triffView;
     private EveSettingsController? _eveSettings;
+    private TriffFleetsController? _triffFleets;
     private InputOverlayWindow? _inputOverlay;
     private GuiThemePalette _guiTheme = GuiThemePalette.TriffTools;
+    private TriffViewUpdateSnapshot _updateSnapshot;
+    private bool _settingsAlwaysOnTop = true;
     private bool _isClosing;
     private bool _conflictWarningShown;
+    private bool _updateCheckInFlight;
+    private bool _updateBalloonShown;
 
     public MainWindow(string[] args)
     {
         _args = args;
+        _updateChecker = new TriffViewUpdateChecker();
+        _updateSnapshot = TriffViewUpdateSnapshot.Idle(_updateChecker.CurrentVersion);
         _conflictTimer = new System.Windows.Threading.DispatcherTimer
         {
             Interval = TimeSpan.FromSeconds(2),
@@ -170,11 +184,13 @@ public partial class MainWindow : Window
     {
         InitializeTriffView();
         InitializeEveSettings();
+        InitializeTriffFleets();
         InitializeTray();
         await InitializeWebViewAsync();
         InitializeInputOverlay();
         ShowSettings();
         _conflictTimer.Start();
+        _ = CheckForUpdatesAsync(manual: false);
     }
 
     private void OnClosed(object? sender, EventArgs e)
@@ -196,20 +212,37 @@ public partial class MainWindow : Window
 
     private void OnStateChanged(object sender, EventArgs e)
     {
-        if (WindowState != WindowState.Minimized) return;
-        WindowState = WindowState.Normal;
-        HideSettings();
+        if (WindowState == WindowState.Minimized)
+        {
+            UpdateControlState();
+            PostAppEvent(new { type = "visibility", visible = false });
+            return;
+        }
+
+        ApplySettingsAlwaysOnTop(_settingsAlwaysOnTop);
+        UpdateControlState();
+        PostAppEvent(new { type = "visibility", visible = true });
     }
 
     private void InitializeTriffView()
     {
-        _triffView = new TriffViewController(Dispatcher, PostAppEvent, () => Dispatcher.InvokeAsync(BringSettingsAbovePreviews));
+        _triffView = new TriffViewController(
+            Dispatcher,
+            PostAppEvent,
+            () => Dispatcher.InvokeAsync(BringSettingsAbovePreviews),
+            alwaysOnTop => Dispatcher.InvokeAsync(() => ApplySettingsAlwaysOnTop(alwaysOnTop))
+        );
         _triffView.Start();
     }
 
     private void InitializeEveSettings()
     {
         _eveSettings = new EveSettingsController(Dispatcher, PostAppEvent);
+    }
+
+    private void InitializeTriffFleets()
+    {
+        _triffFleets = new TriffFleetsController(Dispatcher, PostAppEvent);
     }
 
     private void InitializeTray()
@@ -220,9 +253,11 @@ public partial class MainWindow : Window
         _triffViewHotkeysItem = new Forms.ToolStripMenuItem("Suspend TriffView hotkeys", null, (_, _) => ToggleTriffViewHotkeys());
         var openTriffViewItem = new Forms.ToolStripMenuItem("Open TriffView settings", null, (_, _) => OpenTool("triffview"));
         var openEveSettingsItem = new Forms.ToolStripMenuItem("Open EVE Settings", null, (_, _) => OpenTool("eve-settings"));
+        var openFleetManagerItem = new Forms.ToolStripMenuItem("Open Fleet Manager", null, (_, _) => OpenTool("fleet-manager"));
         var savePreviewItem = new Forms.ToolStripMenuItem("Save preview positions", null, (_, _) => PostTriffViewNativeCommand("save-preview-layout"));
         var saveClientsItem = new Forms.ToolStripMenuItem("Save EVE client positions", null, (_, _) => PostTriffViewNativeCommand("save-client-layouts"));
         var restoreClientsItem = new Forms.ToolStripMenuItem("Restore EVE client positions", null, (_, _) => PostTriffViewNativeCommand("restore-client-layouts"));
+        var checkUpdatesItem = new Forms.ToolStripMenuItem("Check for updates", null, (_, _) => _ = CheckForUpdatesAsync(manual: true));
         var reloadItem = new Forms.ToolStripMenuItem("Reload UI", null, (_, _) => AppWebView.Reload());
         var quitItem = new Forms.ToolStripMenuItem("Quit", null, (_, _) => Quit());
 
@@ -236,6 +271,7 @@ public partial class MainWindow : Window
         menu.Items.Add(_showHideItem);
         menu.Items.Add(openTriffViewItem);
         menu.Items.Add(openEveSettingsItem);
+        menu.Items.Add(openFleetManagerItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(_triffViewEnabledItem);
         menu.Items.Add(_triffViewHotkeysItem);
@@ -243,6 +279,7 @@ public partial class MainWindow : Window
         menu.Items.Add(saveClientsItem);
         menu.Items.Add(restoreClientsItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
+        menu.Items.Add(checkUpdatesItem);
         menu.Items.Add(reloadItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(quitItem);
@@ -256,6 +293,7 @@ public partial class MainWindow : Window
         _trayMenu = menu;
         _trayIcon.MouseUp += OnTrayMouseUp;
         _trayIcon.DoubleClick += (_, _) => OpenTool("triffview");
+        _trayIcon.BalloonTipClicked += (_, _) => OpenUpdateRelease();
         UpdateControlState();
     }
 
@@ -587,6 +625,11 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (_triffFleets?.HandleWebMessage(type, message) == true)
+        {
+            return;
+        }
+
         switch (type)
         {
             case "hide":
@@ -607,9 +650,19 @@ public partial class MainWindow : Window
             case "standalone:set-theme":
                 ApplyStandaloneTheme(message?["theme"] as JsonObject);
                 break;
+            case "update:check":
+                _ = CheckForUpdatesAsync(manual: true);
+                break;
+            case "update:open":
+                OpenUpdateRelease();
+                break;
+            case "update:ignore-version":
+                IgnoreUpdateVersion(message?["version"]?.GetValue<string>());
+                break;
             case "settings:get":
             case "standalone:ready":
                 PostAppSettings();
+                PostUpdateState();
                 break;
         }
     }
@@ -655,7 +708,7 @@ public partial class MainWindow : Window
 
     private void ToggleSettings()
     {
-        if (IsVisible) HideSettings();
+        if (SettingsWindowIsShown()) HideSettings();
         else ShowSettings();
     }
 
@@ -685,11 +738,23 @@ public partial class MainWindow : Window
     private void BringSettingsAbovePreviews()
     {
         if (!IsVisible) return;
-        Topmost = true;
+        ApplySettingsAlwaysOnTop(_settingsAlwaysOnTop);
+        if (!_settingsAlwaysOnTop) return;
+    }
+
+    private bool SettingsWindowIsShown()
+    {
+        return IsVisible && WindowState != WindowState.Minimized;
+    }
+
+    private void ApplySettingsAlwaysOnTop(bool alwaysOnTop)
+    {
+        _settingsAlwaysOnTop = alwaysOnTop;
+        Topmost = alwaysOnTop;
         var hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
         if (hwnd != nint.Zero)
         {
-            SetWindowPos(hwnd, HwndTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate | SwpFrameChanged);
+            SetWindowPos(hwnd, alwaysOnTop ? HwndTopmost : HwndNotTopmost, 0, 0, 0, 0, SwpNoMove | SwpNoSize | SwpNoActivate | SwpFrameChanged);
         }
     }
 
@@ -727,7 +792,7 @@ public partial class MainWindow : Window
 
     private void UpdateControlState()
     {
-        if (_showHideItem != null) _showHideItem.Text = IsVisible ? "Hide Settings" : "Show Settings";
+        if (_showHideItem != null) _showHideItem.Text = SettingsWindowIsShown() ? "Hide Settings" : "Show Settings";
         if (_triffViewEnabledItem != null)
         {
             var enabled = _triffView?.Settings.Enabled == true;
@@ -785,7 +850,7 @@ public partial class MainWindow : Window
     {
         try
         {
-            var json = JsonSerializer.Serialize(message);
+            var json = JsonSerializer.Serialize(message, WebMessageJsonOptions);
             Dispatcher.InvokeAsync(() => AppWebView.CoreWebView2?.PostWebMessageAsJson(json));
         }
         catch
@@ -804,7 +869,7 @@ public partial class MainWindow : Window
         {
             type = "settings",
             opacity = 1,
-            alwaysOnTop = true,
+            alwaysOnTop = _settingsAlwaysOnTop,
             screen = new
             {
                 virtualDesktop = new
@@ -837,6 +902,114 @@ public partial class MainWindow : Window
                     width = screen.Bounds.Width,
                     height = screen.Bounds.Height,
                 }).ToArray(),
+            },
+        });
+    }
+
+    private async Task CheckForUpdatesAsync(bool manual)
+    {
+        if (_updateCheckInFlight) return;
+
+        _updateCheckInFlight = true;
+        _updateSnapshot = TriffViewUpdateSnapshot.Checking(_updateChecker.CurrentVersion);
+        if (manual) PostUpdateState();
+
+        try
+        {
+            _updateSnapshot = await _updateChecker.CheckLatestAsync();
+            PostUpdateState();
+
+            if (string.Equals(_updateSnapshot.Status, "failed", StringComparison.OrdinalIgnoreCase))
+            {
+                if (manual)
+                {
+                    System.Windows.MessageBox.Show(this, $"Could not check GitHub releases right now.\n\n{_updateSnapshot.Error}", "TriffView updates", MessageBoxButton.OK, MessageBoxImage.Warning);
+                }
+                return;
+            }
+
+            if (_updateSnapshot.UpdateAvailable && !_updateSnapshot.Ignored)
+            {
+                if (manual)
+                {
+                    ShowSettings();
+                }
+                else
+                {
+                    ShowUpdateBalloonOnce();
+                }
+            }
+            else if (manual)
+            {
+                var message = _updateSnapshot.Ignored
+                    ? $"TriffView {_updateSnapshot.LatestTag} is available, but you chose to ignore this version."
+                    : $"You're up to date. Current version: {_updateSnapshot.CurrentVersion}.";
+                System.Windows.MessageBox.Show(this, message, "TriffView updates", MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        catch (Exception ex)
+        {
+            _updateSnapshot = TriffViewUpdateSnapshot.Failed(_updateChecker.CurrentVersion, ex.Message);
+            PostUpdateState();
+            if (manual)
+            {
+                System.Windows.MessageBox.Show(this, $"Could not check GitHub releases right now.\n\n{ex.Message}", "TriffView updates", MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+        }
+        finally
+        {
+            _updateCheckInFlight = false;
+        }
+    }
+
+    private void ShowUpdateBalloonOnce()
+    {
+        if (_updateBalloonShown || _trayIcon == null) return;
+        _updateBalloonShown = true;
+        _trayIcon.ShowBalloonTip(
+            8000,
+            "TriffView update available",
+            $"{_updateSnapshot.LatestTag} is available. Open TriffView settings to download it from GitHub.",
+            Forms.ToolTipIcon.Info
+        );
+    }
+
+    private void OpenUpdateRelease()
+    {
+        var url = !string.IsNullOrWhiteSpace(_updateSnapshot.ReleaseUrl)
+            ? _updateSnapshot.ReleaseUrl
+            : TriffViewUpdateChecker.ReleasesPageUrl;
+        OpenExternal(url);
+    }
+
+    private void IgnoreUpdateVersion(string? version)
+    {
+        var versionToIgnore = string.IsNullOrWhiteSpace(version) ? _updateSnapshot.LatestVersion : version;
+        _updateChecker.IgnoreVersion(versionToIgnore);
+        if (string.Equals(_updateSnapshot.LatestVersion, versionToIgnore, StringComparison.OrdinalIgnoreCase))
+        {
+            _updateSnapshot = _updateSnapshot with { Ignored = true };
+        }
+        PostUpdateState();
+    }
+
+    private void PostUpdateState()
+    {
+        PostAppEvent(new
+        {
+            type = "update-state",
+            update = new
+            {
+                status = _updateSnapshot.Status,
+                currentVersion = _updateSnapshot.CurrentVersion,
+                latestVersion = _updateSnapshot.LatestVersion,
+                latestTag = _updateSnapshot.LatestTag,
+                title = _updateSnapshot.Title,
+                releaseUrl = _updateSnapshot.ReleaseUrl,
+                publishedAt = _updateSnapshot.PublishedAt?.ToString("O"),
+                updateAvailable = _updateSnapshot.UpdateAvailable,
+                ignored = _updateSnapshot.Ignored,
+                error = _updateSnapshot.Error,
             },
         });
     }
