@@ -7,6 +7,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Windows.Threading;
+using TriffView.Alerts;
 using Forms = System.Windows.Forms;
 
 namespace TriffView.Preview;
@@ -19,6 +20,7 @@ internal sealed class TriffViewController : IDisposable
     private readonly Action _reassertHudTopmost;
     private readonly Action<bool> _applySettingsAlwaysOnTop;
     private readonly EveWindowTracker _tracker = new();
+    private readonly TriffAlertsService _alerts = new();
     private readonly DispatcherTimer _timer;
     private readonly TriffViewOverlayForm _overlay;
     private bool _settingsPanelOpen;
@@ -32,6 +34,7 @@ internal sealed class TriffViewController : IDisposable
 
     public TriffViewSettings Settings { get; }
     public bool SettingsPanelOpen => _settingsPanelOpen;
+    public event Action<TriffAlertEvent>? AlertNotificationRequested;
 
     public TriffViewController(Dispatcher dispatcher, Action<object> postToHud, Action reassertHudTopmost, Action<bool> applySettingsAlwaysOnTop)
     {
@@ -45,6 +48,8 @@ internal sealed class TriffViewController : IDisposable
         _overlay.MinimizeRequested += MinimizeClient;
         _overlay.PreviewLayoutChanged += SavePreviewLayout;
         _overlay.HotkeyPressed += HandleHotkey;
+        _alerts.AlertTriggered += OnAlertTriggered;
+        _alerts.UpdateSettings(Settings.Alerts);
 
         _timer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
         {
@@ -91,6 +96,19 @@ internal sealed class TriffViewController : IDisposable
                 return true;
             case "triffview:update-profile":
                 ApplyProfilePatch(message?["patch"] as JsonObject);
+                return true;
+            case "triffalerts:update-settings":
+                ApplyAlertsPatch(message?["patch"] as JsonObject);
+                return true;
+            case "triffalerts:update-event":
+                ApplyAlertEventPatch(message?["eventType"]?.GetValue<string>(), message?["patch"] as JsonObject);
+                return true;
+            case "triffalerts:test":
+                TestAlert(message?["eventType"]?.GetValue<string>(), message?["characterName"]?.GetValue<string>());
+                return true;
+            case "triffalerts:clear-history":
+                _alerts.ClearHistory();
+                PostState(force: true);
                 return true;
             case "triffview:set-profile":
                 SelectProfile(message?["profileId"]?.GetValue<string>());
@@ -229,6 +247,7 @@ internal sealed class TriffViewController : IDisposable
         if (_disposed) return;
         _disposed = true;
         _timer.Stop();
+        _alerts.Dispose();
         _overlay.Dispose();
     }
 
@@ -273,6 +292,7 @@ internal sealed class TriffViewController : IDisposable
             _clients = _clients
                 .Select(client => client with { IsForeground = client.Handle == activeHandle })
                 .ToArray();
+            _alerts.SetActiveCharacters(_clients.Select(client => client.CharacterName));
 
             AutoRestoreClientLayouts(profile, _clients);
             _overlay.SetClients(_clients, profile, foreground, activeHandle: activeHandle);
@@ -676,6 +696,121 @@ internal sealed class TriffViewController : IDisposable
         Refresh();
     }
 
+    private void ApplyAlertsPatch(JsonObject? patch)
+    {
+        if (patch == null) return;
+        var alerts = Settings.Alerts;
+        foreach (var (key, value) in patch)
+        {
+            switch (key)
+            {
+                case "enabled":
+                    alerts.Enabled = value?.GetValue<bool>() == true;
+                    break;
+                case "pveMode":
+                    alerts.PveMode = value?.GetValue<bool>() == true;
+                    break;
+                case "masterVolume":
+                    alerts.MasterVolume = ClampDouble(value, 0, 1, alerts.MasterVolume);
+                    break;
+            }
+        }
+
+        alerts.Normalize();
+        Settings.Save();
+        _alerts.UpdateSettings(Settings.Alerts);
+        PostState(force: true);
+    }
+
+    private void ApplyAlertEventPatch(string? eventType, JsonObject? patch)
+    {
+        if (string.IsNullOrWhiteSpace(eventType) || patch == null) return;
+        var alerts = Settings.Alerts;
+        alerts.Normalize();
+        if (!alerts.Events.TryGetValue(eventType.Trim(), out var config)) return;
+
+        foreach (var (key, value) in patch)
+        {
+            switch (key)
+            {
+                case "enabled":
+                    config.Enabled = value?.GetValue<bool>() == true;
+                    break;
+                case "severity":
+                    config.Severity = TriffAlertSeverity.Normalize(value?.GetValue<string>(), config.Severity);
+                    break;
+                case "cooldownSeconds":
+                    config.CooldownSeconds = ClampInt(value, 0, 120, config.CooldownSeconds);
+                    break;
+                case "flashEnabled":
+                    config.FlashEnabled = value?.GetValue<bool>() == true;
+                    break;
+                case "flashColor":
+                    config.FlashColor = CleanColor(value, config.FlashColor);
+                    break;
+                case "flashThickness":
+                    config.FlashThickness = ClampInt(value, 1, 24, config.FlashThickness);
+                    break;
+                case "flashDurationMs":
+                    config.FlashDurationMs = ClampInt(value, 250, 15000, config.FlashDurationMs);
+                    break;
+                case "flashPulseCount":
+                    config.FlashPulseCount = ClampInt(value, 1, 16, config.FlashPulseCount);
+                    break;
+                case "sound":
+                    config.Sound = (value?.GetValue<string>() ?? "none").Trim().ToLowerInvariant();
+                    break;
+                case "trayNotification":
+                    config.TrayNotification = value?.GetValue<bool>() == true;
+                    break;
+            }
+        }
+
+        alerts.Normalize();
+        Settings.Save();
+        _alerts.UpdateSettings(Settings.Alerts);
+        PostState(force: true);
+    }
+
+    private void TestAlert(string? eventType, string? characterName)
+    {
+        var target = characterName;
+        if (string.IsNullOrWhiteSpace(target))
+        {
+            target = _clients.FirstOrDefault()?.CharacterName;
+        }
+
+        _alerts.TestAlert(eventType, target);
+        PostState(force: true);
+    }
+
+    private void OnAlertTriggered(object? sender, TriffAlertEvent alert)
+    {
+        if (_disposed) return;
+        _dispatcher.InvokeAsync(() =>
+        {
+            if (_disposed) return;
+            var config = Settings.Alerts.Event(alert.Type);
+            if (config.FlashEnabled)
+            {
+                _overlay.ShowAlert(alert.CharacterName, new TriffViewPreviewAlert(
+                    config.SeverityRank,
+                    config.FlashColor,
+                    config.FlashThickness,
+                    config.FlashDurationMs,
+                    config.FlashPulseCount
+                ));
+            }
+
+            if (config.TrayNotification)
+            {
+                AlertNotificationRequested?.Invoke(alert);
+            }
+
+            PostState(force: true);
+        });
+    }
+
     private static void ApplyProfilePreviewSizeToSavedLayouts(TriffViewProfile profile)
     {
         foreach (var layout in profile.PreviewLayouts.Values)
@@ -769,9 +904,14 @@ internal sealed class TriffViewController : IDisposable
 
         Settings.Enabled = imported.Enabled;
         Settings.HotkeysSuspended = imported.HotkeysSuspended;
+        Settings.SettingsWindowAlwaysOnTop = imported.SettingsWindowAlwaysOnTop;
+        Settings.GuideCompleted = imported.GuideCompleted;
+        Settings.GuideVersion = imported.GuideVersion;
         Settings.SelectedProfileId = imported.SelectedProfileId;
         Settings.Profiles = imported.Profiles;
+        Settings.Alerts = imported.Alerts;
         Settings.Save();
+        _alerts.UpdateSettings(Settings.Alerts);
 
         if (Settings.Enabled)
         {
@@ -1446,6 +1586,8 @@ internal sealed class TriffViewController : IDisposable
                 foreground = client.IsForeground,
                 key = client.StableKey,
             }).ToArray(),
+            alerts = Settings.Alerts.ToState(),
+            alertHistory = _alerts.History.Select(alert => alert.ToState()).ToArray(),
             hotkeyFailures = _overlay.HotkeyFailures,
             dwmAvailable = _overlay.DwmAvailable,
         };
@@ -1609,12 +1751,43 @@ internal sealed class TriffViewController : IDisposable
     }
 }
 
+internal sealed record TriffViewPreviewAlert(
+    int SeverityRank,
+    string Color,
+    int Thickness,
+    int DurationMs,
+    int PulseCount
+);
+
+internal sealed class ActivePreviewAlert
+{
+    public ActivePreviewAlert(int severityRank, string color, int thickness, int durationMs, int pulseCount, DateTime startedUtc, DateTime expiresUtc)
+    {
+        SeverityRank = severityRank;
+        Color = color;
+        Thickness = thickness;
+        DurationMs = durationMs;
+        PulseCount = pulseCount;
+        StartedUtc = startedUtc;
+        ExpiresUtc = expiresUtc;
+    }
+
+    public int SeverityRank { get; }
+    public string Color { get; }
+    public int Thickness { get; }
+    public int DurationMs { get; }
+    public int PulseCount { get; }
+    public DateTime StartedUtc { get; }
+    public DateTime ExpiresUtc { get; set; }
+}
+
 internal sealed class TriffViewOverlayForm : Forms.Form
 {
     private const int ResizeHitSize = 16;
     private const int DragThreshold = 4;
     private readonly Dictionary<nint, PreviewState> _previews = new();
     private readonly Dictionary<int, TriffViewHotkeyCommand> _hotkeys = new();
+    private readonly Forms.Timer _alertTimer = new() { Interval = 80 };
     private readonly TriffViewLabelOverlayForm _labelOverlay = new();
     private string _hotkeySignature = "";
     private int _nextHotkeyId = 3000;
@@ -1647,6 +1820,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         DoubleBuffered = true;
         Font = new Font("Segoe UI", 9, FontStyle.Regular);
         _labelOverlay.Owner = this;
+        _alertTimer.Tick += (_, _) => TickAlertFlashes();
         SizeToVirtualDesktop();
         UpdateWindowRegion(forceEmpty: true);
     }
@@ -1763,6 +1937,24 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         );
     }
 
+    public void ShowAlert(string characterName, TriffViewPreviewAlert alert)
+    {
+        if (string.IsNullOrWhiteSpace(characterName)) return;
+        var now = DateTime.UtcNow;
+        var matched = false;
+
+        foreach (var state in _previews.Values)
+        {
+            if (!MatchesAlertTarget(state, characterName)) continue;
+            state.SetAlert(alert, now);
+            matched = true;
+        }
+
+        if (!matched) return;
+        UpdateAlertTimer();
+        Invalidate();
+    }
+
     public void ConfigureHotkeys(TriffViewProfile profile, IReadOnlyList<EveClientWindow> clients, bool suspended)
     {
         var signature = HotkeySignature(profile, clients, suspended);
@@ -1824,6 +2016,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         }
 
         _previews.Clear();
+        _alertTimer.Stop();
         _labelOverlay.SetItems(Array.Empty<TriffViewLabelOverlayItem>());
         UpdateWindowRegion();
         Invalidate();
@@ -1835,6 +2028,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         {
             UnregisterHotkeys();
             ClearThumbnails();
+            _alertTimer.Dispose();
             _labelOverlay.Dispose();
             Region?.Dispose();
         }
@@ -2112,10 +2306,60 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             graphics.DrawString(text, labelFont, textBrush, textRect, format);
         }
 
+        var activeAlert = state.ActiveAlert(DateTime.UtcNow);
+        if (activeAlert != null)
+        {
+            DrawAlertBorder(graphics, frame, activeAlert);
+        }
+
         var handle = new Rectangle(frame.Right - ResizeHitSize, frame.Bottom - ResizeHitSize, ResizeHitSize - 3, ResizeHitSize - 3);
         using var handlePen = new Pen(Color.FromArgb(180, 217, 226, 238), 1);
         graphics.DrawLine(handlePen, handle.Right - 8, handle.Bottom - 2, handle.Right - 2, handle.Bottom - 8);
         graphics.DrawLine(handlePen, handle.Right - 13, handle.Bottom - 2, handle.Right - 2, handle.Bottom - 13);
+    }
+
+    private void DrawAlertBorder(Graphics graphics, Rectangle frame, ActivePreviewAlert alert)
+    {
+        var baseColor = ColorFromString(alert.Color, Color.FromArgb(255, 59, 59));
+        var elapsed = Math.Max(0, (DateTime.UtcNow - alert.StartedUtc).TotalMilliseconds);
+        var progress = Math.Min(1, elapsed / Math.Max(1, alert.DurationMs));
+        var wave = (Math.Sin(progress * alert.PulseCount * Math.PI * 2) + 1) / 2;
+        var alpha = (int)Math.Max(90, Math.Min(255, 110 + wave * 145));
+        using var path = RoundedRect(frame, 6);
+        using var pen = new Pen(Color.FromArgb(alpha, baseColor), Math.Max(1, alert.Thickness))
+        {
+            Alignment = PenAlignment.Inset,
+            LineJoin = LineJoin.Round,
+        };
+        graphics.DrawPath(pen, path);
+    }
+
+    private void TickAlertFlashes()
+    {
+        var now = DateTime.UtcNow;
+        var removed = false;
+        foreach (var state in _previews.Values)
+        {
+            removed |= state.ClearExpiredAlert(now);
+        }
+
+        var anyActive = _previews.Values.Any(state => state.ActiveAlert(now) != null);
+        if (!anyActive) _alertTimer.Stop();
+        if (removed || anyActive) Invalidate();
+    }
+
+    private void UpdateAlertTimer()
+    {
+        var anyActive = _previews.Values.Any(state => state.ActiveAlert(DateTime.UtcNow) != null);
+        if (anyActive && !_alertTimer.Enabled) _alertTimer.Start();
+        if (!anyActive && _alertTimer.Enabled) _alertTimer.Stop();
+    }
+
+    private static bool MatchesAlertTarget(PreviewState state, string characterName)
+    {
+        return string.Equals(state.Client.CharacterName, characterName, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(state.Client.StableKey, characterName, StringComparison.OrdinalIgnoreCase)
+            || string.Equals(state.Client.Title, characterName, StringComparison.OrdinalIgnoreCase);
     }
 
     private void UpdateWindowRegion(bool forceEmpty = false)
@@ -2285,6 +2529,35 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         public Rectangle FrameRect { get; set; }
         public bool Active { get; set; }
         public bool Visible { get; set; }
+        private ActivePreviewAlert? Alert { get; set; }
+
+        public void SetAlert(TriffViewPreviewAlert alert, DateTime now)
+        {
+            if (Alert != null && Alert.ExpiresUtc > now && Alert.SeverityRank > alert.SeverityRank)
+            {
+                Alert.ExpiresUtc = now.AddMilliseconds(Math.Max(1, alert.DurationMs));
+                return;
+            }
+
+            Alert = new ActivePreviewAlert(
+                alert.SeverityRank,
+                alert.Color,
+                alert.Thickness,
+                alert.DurationMs,
+                alert.PulseCount,
+                now,
+                now.AddMilliseconds(Math.Max(1, alert.DurationMs))
+            );
+        }
+
+        public ActivePreviewAlert? ActiveAlert(DateTime now) => Alert != null && Alert.ExpiresUtc > now ? Alert : null;
+
+        public bool ClearExpiredAlert(DateTime now)
+        {
+            if (Alert == null || Alert.ExpiresUtc > now) return false;
+            Alert = null;
+            return true;
+        }
     }
 
     private enum MouseMode
@@ -2635,6 +2908,7 @@ internal sealed class TriffViewSettings
     public bool GuideCompleted { get; set; }
     public string GuideVersion { get; set; } = "";
     public string SelectedProfileId { get; set; } = "default";
+    public TriffAlertsSettings Alerts { get; set; } = TriffAlertsSettings.CreateDefault();
     public List<TriffViewProfile> Profiles { get; set; } = new() { TriffViewProfile.CreateDefault("Default") };
 
     public static string SettingsPath =>
@@ -2696,6 +2970,8 @@ internal sealed class TriffViewSettings
     {
         GuideVersion = GuideVersion?.Trim() ?? "";
         if (!GuideCompleted) GuideVersion = "";
+        Alerts ??= TriffAlertsSettings.CreateDefault();
+        Alerts.Normalize();
         if (Profiles.Count == 0) Profiles.Add(TriffViewProfile.CreateDefault("Default"));
         foreach (var profile in Profiles) profile.Normalize();
         if (Profiles.All(profile => !string.Equals(profile.Id, SelectedProfileId, StringComparison.OrdinalIgnoreCase)))

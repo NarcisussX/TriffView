@@ -1,5 +1,9 @@
 import React, { Suspense, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { onNativeMessage, openExternalUrl, postNative } from "./nativeBridge.js";
+import alarmSoundUrl from "./assets/sounds/alarm.ogg";
+import dingSoundUrl from "./assets/sounds/ding.ogg";
+import sirenSoundUrl from "./assets/sounds/siren.ogg";
+import woopSoundUrl from "./assets/sounds/woop.ogg";
 import TriffViewSettings from "./tools/TriffViewSettings.jsx";
 
 const EveSettings = React.lazy(() => import("./tools/EveSettings.tsx"));
@@ -21,6 +25,12 @@ const GUI_THEMES = [
   { id: "ore", name: "ORE", swatches: ["#F0C515", "#62B2B3", "#D88475"] },
   { id: "servant-sisters", name: "Servant Sisters of EVE", swatches: ["#F15B64", "#A8D8D8", "#BDBB2B"] },
 ];
+const ALERT_SOUND_URLS = {
+  alarm: alarmSoundUrl,
+  woop: woopSoundUrl,
+  siren: sirenSoundUrl,
+  ding: dingSoundUrl,
+};
 
 function readSavedTheme() {
   try {
@@ -106,6 +116,8 @@ export default function App() {
   const [updateInfo, setUpdateInfo] = useState(null);
   const [dismissedUpdateVersion, setDismissedUpdateVersion] = useState("");
   const rootRef = useRef(null);
+  const alertAudioReadyRef = useRef(false);
+  const playedAlertIdsRef = useRef(new Set());
   const activeTheme = GUI_THEMES.find((theme) => theme.id === themeId) || GUI_THEMES[0];
   const showUpdateNotice =
     updateInfo?.updateAvailable &&
@@ -120,6 +132,34 @@ export default function App() {
   }, [activeTheme.id, themeId]);
 
   useEffect(() => {
+    function playAlertSound(message) {
+      const history = Array.isArray(message.alertHistory) ? message.alertHistory : [];
+      if (!alertAudioReadyRef.current) {
+        history.forEach((alert) => {
+          if (alert?.id) playedAlertIdsRef.current.add(alert.id);
+        });
+        alertAudioReadyRef.current = true;
+        return;
+      }
+
+      const newest = history[0];
+      if (!newest?.id || playedAlertIdsRef.current.has(newest.id)) return;
+      playedAlertIdsRef.current.add(newest.id);
+      if (playedAlertIdsRef.current.size > 250) {
+        playedAlertIdsRef.current = new Set(Array.from(playedAlertIdsRef.current).slice(-160));
+      }
+
+      const alerts = message.alerts && typeof message.alerts === "object" ? message.alerts : {};
+      const events = alerts.events && typeof alerts.events === "object" ? alerts.events : {};
+      const config = events[newest.type] || {};
+      const soundUrl = ALERT_SOUND_URLS[config.sound || "none"];
+      if (!soundUrl) return;
+
+      const audio = new Audio(soundUrl);
+      audio.volume = Math.max(0, Math.min(1, Number(alerts.masterVolume ?? 0.75)));
+      audio.play().catch(() => {});
+    }
+
     const unsubscribe = onNativeMessage((message) => {
       if (message?.type === "standalone:navigate") {
         const tool = String(message.tool || "");
@@ -128,6 +168,8 @@ export default function App() {
         }
       } else if (message?.type === "update-state") {
         setUpdateInfo(message.update || null);
+      } else if (message?.type === "triffview:state") {
+        playAlertSound(message);
       }
     });
 

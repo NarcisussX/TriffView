@@ -12,9 +12,110 @@ const EMPTY_STATE = {
   profiles: [{ id: "default", name: "Default" }],
   profile: {},
   clients: [],
+  alerts: null,
+  alertHistory: [],
   hotkeyFailures: [],
   dwmAvailable: true,
 };
+
+const ALERT_EVENT_DEFS = [
+  { id: "attack", label: "Attack", description: "Incoming damage and hostile misses against the listener character." },
+  { id: "warp_scramble", label: "Warp scramble", description: "Warp disruption attempts and disruption zone messages." },
+  { id: "decloak", label: "Decloak", description: "Cloak deactivation notifications from proximity or other causes." },
+  { id: "fleet_invite", label: "Fleet invite", description: "Fleet invitation prompts." },
+  { id: "convo_request", label: "Convo request", description: "Conversation invitation prompts." },
+  { id: "system_change", label: "System change", description: "Jumping and undocking system-change log lines." },
+];
+
+const ALERT_EVENT_DEFAULTS = {
+  attack: {
+    severity: "critical",
+    cooldownSeconds: 1,
+    flashColor: "#FF3B3B",
+    flashThickness: 24,
+    flashDurationMs: 900,
+    flashPulseCount: 2,
+  },
+  warp_scramble: {
+    severity: "warning",
+    cooldownSeconds: 8,
+    flashColor: "#737B8C",
+    flashThickness: 24,
+    flashDurationMs: 400,
+    flashPulseCount: 1,
+  },
+  decloak: {
+    severity: "critical",
+    cooldownSeconds: 8,
+    flashColor: "#FFCC4D",
+    flashThickness: 24,
+    flashDurationMs: 4500,
+    flashPulseCount: 6,
+  },
+  fleet_invite: {
+    severity: "info",
+    cooldownSeconds: 10,
+    flashColor: "#53B6FF",
+    flashThickness: 24,
+    flashDurationMs: 400,
+    flashPulseCount: 1,
+  },
+  convo_request: {
+    severity: "info",
+    cooldownSeconds: 10,
+    flashColor: "#B58CFF",
+    flashThickness: 24,
+    flashDurationMs: 400,
+    flashPulseCount: 1,
+  },
+  system_change: {
+    severity: "info",
+    cooldownSeconds: 10,
+    flashColor: "#52FF54",
+    flashThickness: 24,
+    flashDurationMs: 400,
+    flashPulseCount: 1,
+  },
+};
+
+const DEFAULT_ALERT_EVENTS = ALERT_EVENT_DEFS.reduce((events, event) => {
+  const defaults = ALERT_EVENT_DEFAULTS[event.id];
+  events[event.id] = {
+    type: event.id,
+    label: event.label,
+    enabled: true,
+    severity: defaults.severity,
+    cooldownSeconds: defaults.cooldownSeconds,
+    flashEnabled: true,
+    flashColor: defaults.flashColor,
+    flashThickness: defaults.flashThickness,
+    flashDurationMs: defaults.flashDurationMs,
+    flashPulseCount: defaults.flashPulseCount,
+    sound: "none",
+    trayNotification: false,
+  };
+  return events;
+}, {});
+
+const DEFAULT_ALERTS = {
+  enabled: false,
+  pveMode: true,
+  masterVolume: 0.75,
+  events: DEFAULT_ALERT_EVENTS,
+};
+
+const ALERT_SOUND_OPTIONS = [
+  { value: "none", label: "None" },
+  { value: "alarm", label: "Alarm" },
+  { value: "woop", label: "Woop" },
+  { value: "siren", label: "Siren" },
+  { value: "ding", label: "Ding" },
+];
+
+const ALERT_SOUND_BY_ID = ALERT_SOUND_OPTIONS.reduce((map, option) => {
+  map[option.value] = option;
+  return map;
+}, {});
 
 function send(type, payload = {}) {
   postNative({ type, ...payload });
@@ -22,6 +123,14 @@ function send(type, payload = {}) {
 
 function patchProfile(patch) {
   send("triffview:update-profile", { patch });
+}
+
+function patchAlerts(patch) {
+  send("triffalerts:update-settings", { patch });
+}
+
+function patchAlertEvent(eventType, patch) {
+  send("triffalerts:update-event", { eventType, patch });
 }
 
 function Field({ label, children }) {
@@ -368,6 +477,32 @@ function ColorSetting({ label, value, onCommit }) {
   );
 }
 
+function ColorWheelSetting({ label, value, onCommit }) {
+  const normalized = normalizeHexColor(value) || "#53B6FF";
+
+  return (
+    <div className="triffview-field triff-alert-color-wheel">
+      <span>{label}</span>
+      <div className="triff-alert-color-wheel-row">
+        <input
+          type="color"
+          value={normalized}
+          aria-label={`${label} color`}
+          onChange={(event) => onCommit(normalizeHexColor(event.target.value) || normalized)}
+        />
+        <input
+          value={normalized}
+          spellCheck="false"
+          onChange={(event) => {
+            const color = normalizeHexColor(event.target.value);
+            if (color) onCommit(color);
+          }}
+        />
+      </div>
+    </div>
+  );
+}
+
 function splitNames(value) {
   return String(value || "")
     .split(/[\n,]/)
@@ -377,6 +512,40 @@ function splitNames(value) {
 
 function uniqueNames(values) {
   return Array.from(new Set(values.filter(Boolean).map((value) => value.trim()).filter(Boolean)));
+}
+
+function normalizeAlertsState(alerts) {
+  const source = alerts && typeof alerts === "object" ? alerts : {};
+  const sourceEvents = source.events && typeof source.events === "object" ? source.events : {};
+  const events = {};
+  for (const eventDef of ALERT_EVENT_DEFS) {
+    events[eventDef.id] = {
+      ...DEFAULT_ALERT_EVENTS[eventDef.id],
+      ...(sourceEvents[eventDef.id] || {}),
+      type: eventDef.id,
+      label: eventDef.label,
+    };
+  }
+  return {
+    ...DEFAULT_ALERTS,
+    ...source,
+    masterVolume: Number.isFinite(Number(source.masterVolume)) ? Number(source.masterVolume) : DEFAULT_ALERTS.masterVolume,
+    events,
+  };
+}
+
+function formatAlertTime(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+}
+
+function severityLabel(value) {
+  const clean = String(value || "info").toLowerCase();
+  if (clean === "critical") return "Critical";
+  if (clean === "warning") return "Warning";
+  return "Info";
 }
 
 function namesText(values) {
@@ -867,9 +1036,12 @@ function TriffViewSettings({ open = true }) {
   const [guideStep, setGuideStep] = useState(0);
   const [editingProfileName, setEditingProfileName] = useState(false);
   const [profileNameDraft, setProfileNameDraft] = useState("");
+  const [expandedAlerts, setExpandedAlerts] = useState({});
   const guidePromptedRef = useRef(false);
   const profile = state.profile || {};
   const clients = Array.isArray(state.clients) ? state.clients : [];
+  const alerts = useMemo(() => normalizeAlertsState(state.alerts), [state.alerts]);
+  const alertHistory = Array.isArray(state.alertHistory) ? state.alertHistory : [];
   const failures = Array.isArray(state.hotkeyFailures) ? state.hotkeyFailures : [];
   const previewLabels = useMemo(
     () => (profile.previewLabels && typeof profile.previewLabels === "object" && !Array.isArray(profile.previewLabels) ? profile.previewLabels : {}),
@@ -904,6 +1076,7 @@ function TriffViewSettings({ open = true }) {
     ["profile", "Profile settings"],
     ["layout", "Preview layout"],
     ["colors", "Color settings"],
+    ["alerts", "Alerts"],
     ["hotkeys", "Character Hotkeys"],
     ["cycles", "Cycle Groups and Hotkeys"],
     ["clients", "Client management"],
@@ -1029,6 +1202,14 @@ function TriffViewSettings({ open = true }) {
     setActiveSection("profile");
   }
 
+  function toggleAlertExpanded(eventType) {
+    setExpandedAlerts((current) => ({
+      ...current,
+      [eventType]: !current[eventType],
+    }));
+  }
+
+
   useEffect(() => {
     if (!recording) return undefined;
 
@@ -1087,6 +1268,8 @@ function TriffViewSettings({ open = true }) {
           ...message,
           profile: message.profile || {},
           clients: Array.isArray(message.clients) ? message.clients : [],
+          alerts: message.alerts || EMPTY_STATE.alerts,
+          alertHistory: Array.isArray(message.alertHistory) ? message.alertHistory : [],
           profiles: Array.isArray(message.profiles) && message.profiles.length ? message.profiles : EMPTY_STATE.profiles,
         });
       }
@@ -1432,6 +1615,175 @@ function TriffViewSettings({ open = true }) {
               onCommit={(value) => patchProfile({ labelBackgroundColor: value })}
             />
           </div>
+        </div>
+        ) : null}
+
+        {activeSection === "alerts" ? (
+        <div className="triffview-panel">
+          <div className="triff-alert-summary">
+            <div>
+              <strong>TriffAlerts</strong>
+              <span>Uses EVE log files only. Does not control EVE clients.</span>
+            </div>
+            <span className={alerts.enabled ? "triff-alert-status is-on" : "triff-alert-status"}>
+              {alerts.enabled ? "Enabled" : "Disabled"}
+            </span>
+          </div>
+          <div className="triffview-toggle-grid">
+            <Toggle label="Enable alerts" checked={alerts.enabled} onChange={(value) => patchAlerts({ enabled: value })} />
+            <Toggle label="Only alert in PvP, ignore NPC's" checked={alerts.pveMode} onChange={(value) => patchAlerts({ pveMode: value })} />
+          </div>
+          <div className="triff-alert-event-list">
+            {ALERT_EVENT_DEFS.map((eventDef) => {
+              const config = alerts.events[eventDef.id] || DEFAULT_ALERT_EVENTS[eventDef.id];
+              const expanded = Boolean(expandedAlerts[eventDef.id]);
+              const selectedSound = ALERT_SOUND_BY_ID[config.sound || "none"]?.label || "None";
+              return (
+                <section className={`triff-alert-event is-${config.severity || "info"} ${expanded ? "is-expanded" : ""}`} key={eventDef.id}>
+                  <header className="triff-alert-event-header">
+                    <button
+                      type="button"
+                      className="triff-alert-event-toggle"
+                      aria-expanded={expanded}
+                      onClick={() => toggleAlertExpanded(eventDef.id)}
+                    >
+                      <span className="triff-alert-caret">{expanded ? "-" : "+"}</span>
+                      <span>
+                      <h4>{eventDef.label}</h4>
+                      <p>{eventDef.description}</p>
+                      </span>
+                    </button>
+                    <div className="triff-alert-event-meta">
+                      <span>{config.enabled ? "On" : "Off"}</span>
+                      <span>{severityLabel(config.severity)}</span>
+                      <span>{selectedSound}</span>
+                    </div>
+                    <button
+                      type="button"
+                      className="triff-alert-test-button"
+                      onClick={() => send("triffalerts:test", { eventType: eventDef.id, characterName: clients[0]?.characterName })}
+                    >
+                      Test
+                    </button>
+                  </header>
+                  {expanded ? (
+                  <div className="triff-alert-controls">
+                    <Toggle
+                      label="Enabled"
+                      checked={config.enabled}
+                      onChange={(value) => patchAlertEvent(eventDef.id, { enabled: value })}
+                    />
+                    <Field label="Severity">
+                      <select
+                        value={config.severity || "info"}
+                        onChange={(event) => patchAlertEvent(eventDef.id, { severity: event.target.value })}
+                      >
+                        <option value="critical">Critical</option>
+                        <option value="warning">Warning</option>
+                        <option value="info">Info</option>
+                      </select>
+                    </Field>
+                    <DraftControl
+                      label="Cooldown sec"
+                      type="number"
+                      min="0"
+                      max="120"
+                      value={config.cooldownSeconds ?? 5}
+                      parse={parseInteger}
+                      onCommit={(value) => patchAlertEvent(eventDef.id, { cooldownSeconds: value })}
+                    />
+                    <Toggle
+                      label="Preview flash"
+                      checked={config.flashEnabled}
+                      onChange={(value) => patchAlertEvent(eventDef.id, { flashEnabled: value })}
+                    />
+                    <ColorWheelSetting
+                      label="Flash color"
+                      value={config.flashColor || "#53B6FF"}
+                      onCommit={(value) => patchAlertEvent(eventDef.id, { flashColor: value })}
+                    />
+                    <DraftControl
+                      label="Flash thickness"
+                      type="number"
+                      min="1"
+                      max="24"
+                      value={config.flashThickness ?? 4}
+                      parse={parseInteger}
+                      onCommit={(value) => patchAlertEvent(eventDef.id, { flashThickness: value })}
+                    />
+                    <DraftControl
+                      label="Flash duration ms"
+                      type="number"
+                      min="250"
+                      max="15000"
+                      value={config.flashDurationMs ?? 3000}
+                      parse={parseInteger}
+                      onCommit={(value) => patchAlertEvent(eventDef.id, { flashDurationMs: value })}
+                    />
+                    <DraftControl
+                      label="Flash pulses"
+                      type="number"
+                      min="1"
+                      max="16"
+                      value={config.flashPulseCount ?? 4}
+                      parse={parseInteger}
+                      onCommit={(value) => patchAlertEvent(eventDef.id, { flashPulseCount: value })}
+                    />
+                    <Field label="Sound">
+                      <select
+                        value={config.sound || "none"}
+                        onChange={(event) => patchAlertEvent(eventDef.id, { sound: event.target.value })}
+                      >
+                        {ALERT_SOUND_OPTIONS.map((sound) => (
+                          <option key={sound.value} value={sound.value}>
+                            {sound.label}
+                          </option>
+                        ))}
+                      </select>
+                    </Field>
+                    <Toggle
+                      label="Tray notification"
+                      checked={config.trayNotification}
+                      onChange={(value) => patchAlertEvent(eventDef.id, { trayNotification: value })}
+                    />
+                  </div>
+                  ) : null}
+                </section>
+              );
+            })}
+          </div>
+          <div className="triffview-subsection">
+            <div className="triff-alert-history-head">
+              <h4>Alert history</h4>
+              <button type="button" onClick={() => send("triffalerts:clear-history")}>
+                Clear
+              </button>
+            </div>
+            {alertHistory.length ? (
+              <div className="triff-alert-history" data-hud-scroll>
+                {alertHistory.slice(0, 60).map((alert) => (
+                  <div className={`triff-alert-history-row is-${alert.severity || "info"}`} key={alert.id}>
+                    <span>{formatAlertTime(alert.timestamp)}</span>
+                    <strong>{alert.characterName || "Unknown"}</strong>
+                    <em>{alert.label || alert.type}</em>
+                    <small>{severityLabel(alert.severity)}</small>
+                    <p>{alert.source ? `${alert.source}: ${alert.message}` : alert.message}</p>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <p className="triffview-muted">No alerts in this session yet.</p>
+            )}
+          </div>
+          <SliderControl
+            label="Master volume"
+            min={0}
+            max={100}
+            step={5}
+            unit="%"
+            value={Math.round((alerts.masterVolume ?? 0.75) * 100)}
+            onCommit={(value) => patchAlerts({ masterVolume: value / 100 })}
+          />
         </div>
         ) : null}
 

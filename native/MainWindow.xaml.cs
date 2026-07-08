@@ -8,6 +8,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Windows;
 using Microsoft.Web.WebView2.Core;
+using TriffView.Alerts;
 using TriffView.EveSettings;
 using TriffView.Preview;
 using TriffView.TriffFleets;
@@ -142,6 +143,7 @@ public partial class MainWindow : Window
     private bool _conflictWarningShown;
     private bool _updateCheckInFlight;
     private bool _updateBalloonShown;
+    private string _lastBalloonAction = "";
 
     public MainWindow(string[] args)
     {
@@ -232,6 +234,7 @@ public partial class MainWindow : Window
             () => Dispatcher.InvokeAsync(BringSettingsAbovePreviews),
             alwaysOnTop => Dispatcher.InvokeAsync(() => ApplySettingsAlwaysOnTop(alwaysOnTop))
         );
+        _triffView.AlertNotificationRequested += OnTriffAlertNotification;
         _triffView.Start();
     }
 
@@ -293,7 +296,7 @@ public partial class MainWindow : Window
         _trayMenu = menu;
         _trayIcon.MouseUp += OnTrayMouseUp;
         _trayIcon.DoubleClick += (_, _) => OpenTool("triffview");
-        _trayIcon.BalloonTipClicked += (_, _) => OpenUpdateRelease();
+        _trayIcon.BalloonTipClicked += (_, _) => OnTrayBalloonClicked();
         UpdateControlState();
     }
 
@@ -966,12 +969,47 @@ public partial class MainWindow : Window
     {
         if (_updateBalloonShown || _trayIcon == null) return;
         _updateBalloonShown = true;
+        _lastBalloonAction = "update";
         _trayIcon.ShowBalloonTip(
             8000,
             "TriffView update available",
             $"{_updateSnapshot.LatestTag} is available. Open TriffView settings to download it from GitHub.",
             Forms.ToolTipIcon.Info
         );
+    }
+
+    private void OnTriffAlertNotification(TriffAlertEvent alert)
+    {
+        Dispatcher.InvokeAsync(() =>
+        {
+            if (_trayIcon == null) return;
+            _lastBalloonAction = "alerts";
+            var icon = alert.Severity switch
+            {
+                TriffAlertSeverity.Critical => Forms.ToolTipIcon.Error,
+                TriffAlertSeverity.Warning => Forms.ToolTipIcon.Warning,
+                _ => Forms.ToolTipIcon.Info,
+            };
+            var title = $"{alert.Label} - {alert.CharacterName}";
+            var body = string.IsNullOrWhiteSpace(alert.Source)
+                ? alert.Message
+                : $"{alert.Source}: {alert.Message}";
+            _trayIcon.ShowBalloonTip(5500, title, body, icon);
+        });
+    }
+
+    private void OnTrayBalloonClicked()
+    {
+        if (string.Equals(_lastBalloonAction, "update", StringComparison.OrdinalIgnoreCase))
+        {
+            OpenUpdateRelease();
+        }
+        else
+        {
+            OpenTool("triffview");
+        }
+
+        _lastBalloonAction = "";
     }
 
     private void OpenUpdateRelease()
