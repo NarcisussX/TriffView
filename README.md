@@ -75,6 +75,16 @@ TriffView is licensed under the GNU General Public License, version 3 only (`GPL
 
 Third-party dependency, font, WebView2, and EVE/CCP trademark notices are listed in `THIRD_PARTY_NOTICES.md`.
 
+## Release Verification
+
+Current Windows release: `v1.6.0`
+
+- File: `TriffView.exe`
+- Size: `164,043,480 bytes` (`156.44 MiB`)
+- SHA-256: `5265E19EAAA5677F4647C9481BDD5F99094638D8C54980CA299D96A7ACFCC073`
+
+The release executable is Authenticode signed by Cooper Broderick and timestamped through Microsoft's timestamp service. The download also includes `TriffView.exe.sha256.txt` for verification.
+
 ## Thanks And Inspiration
 
 - [EVE-O Preview](https://github.com/Proopai/eve-o-preview) for the original live preview/multiboxing inspiration.
