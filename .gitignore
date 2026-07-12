@@ -16,6 +16,7 @@ pnpm-debug.log*
 /native/bin/
 /native/obj/
 /native/Assets/overlay-dist.zip
+/tests/
 *.user
 *.suo
 *.rsuser

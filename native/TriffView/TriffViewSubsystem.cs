@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -20,8 +21,11 @@ internal sealed class TriffViewController : IDisposable
     private readonly Action _reassertHudTopmost;
     private readonly Action<bool> _applySettingsAlwaysOnTop;
     private readonly EveWindowTracker _tracker = new();
+    private readonly object _trackerGate = new();
     private readonly TriffAlertsService _alerts = new();
+    private readonly ConcurrentQueue<TriffAlertEvent> _pendingAlerts = new();
     private readonly DispatcherTimer _timer;
+    private readonly DispatcherTimer _switchStateTimer;
     private readonly TriffViewOverlayForm _overlay;
     private bool _settingsPanelOpen;
     private bool _nativeMenuOpen;
@@ -31,6 +35,10 @@ internal sealed class TriffViewController : IDisposable
     private string _autoRestoredProfileId = "";
     private readonly HashSet<string> _autoRestoredClientKeys = new(StringComparer.OrdinalIgnoreCase);
     private nint _activeClientHandle;
+    private int _alertDispatchScheduled;
+    private int _periodicRefreshInProgress;
+    private string _lastClientTopologySignature = "";
+    private string _lastClientStateSignature = "";
 
     public TriffViewSettings Settings { get; }
     public bool SettingsPanelOpen => _settingsPanelOpen;
@@ -55,7 +63,17 @@ internal sealed class TriffViewController : IDisposable
         {
             Interval = TimeSpan.FromMilliseconds(700),
         };
-        _timer.Tick += (_, _) => Refresh();
+        _timer.Tick += (_, _) => QueuePeriodicRefresh();
+
+        _switchStateTimer = new DispatcherTimer(DispatcherPriority.Background, _dispatcher)
+        {
+            Interval = TimeSpan.FromMilliseconds(100),
+        };
+        _switchStateTimer.Tick += (_, _) =>
+        {
+            _switchStateTimer.Stop();
+            PostState();
+        };
     }
 
     public void Start()
@@ -247,6 +265,7 @@ internal sealed class TriffViewController : IDisposable
         if (_disposed) return;
         _disposed = true;
         _timer.Stop();
+        _switchStateTimer.Stop();
         _alerts.Dispose();
         _overlay.Dispose();
     }
@@ -273,40 +292,103 @@ internal sealed class TriffViewController : IDisposable
 
         try
         {
-            var profile = Settings.ActiveProfile();
             var foreground = TriffViewNativeMethods.GetForegroundWindow();
-            var clients = _tracker.GetClients(foreground);
-            _clients = SortClients(clients, profile).ToArray();
-
-            if (_clients.Any(client => client.Handle == foreground))
-            {
-                _activeClientHandle = foreground;
-            }
-
-            if (_activeClientHandle != nint.Zero && _clients.All(client => client.Handle != _activeClientHandle))
-            {
-                _activeClientHandle = nint.Zero;
-            }
-
-            var activeHandle = _activeClientHandle != nint.Zero ? _activeClientHandle : foreground;
-            _clients = _clients
-                .Select(client => client with { IsForeground = client.Handle == activeHandle })
-                .ToArray();
-            _alerts.SetActiveCharacters(_clients.Select(client => client.CharacterName));
-
-            AutoRestoreClientLayouts(profile, _clients);
-            _overlay.SetClients(_clients, profile, foreground, activeHandle: activeHandle);
-            _overlay.ConfigureHotkeys(profile, _clients, Settings.HotkeysSuspended);
-            if (showOverlayAfterRefresh)
-            {
-                ShowOverlay();
-            }
-            PostState();
+            ApplyClientRefresh(GetTrackedClients(foreground), foreground, showOverlayAfterRefresh, forceFullRefresh: true);
         }
         catch (Exception ex)
         {
             PostError("refresh", ex.Message);
         }
+    }
+
+    private async void QueuePeriodicRefresh()
+    {
+        if (_disposed || !Settings.Enabled) return;
+        if (Interlocked.CompareExchange(ref _periodicRefreshInProgress, 1, 0) != 0) return;
+
+        try
+        {
+            var observedForeground = TriffViewNativeMethods.GetForegroundWindow();
+            var clients = await Task.Run(() => GetTrackedClients(observedForeground));
+            if (_disposed || !Settings.Enabled) return;
+            var foreground = TriffViewNativeMethods.GetForegroundWindow();
+            ApplyClientRefresh(clients, foreground, showOverlayAfterRefresh: false, forceFullRefresh: false);
+        }
+        catch (Exception ex)
+        {
+            if (!_disposed) PostError("refresh", ex.Message);
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _periodicRefreshInProgress, 0);
+        }
+    }
+
+    private IReadOnlyList<EveClientWindow> GetTrackedClients(nint foreground)
+    {
+        lock (_trackerGate)
+        {
+            return _tracker.GetClients(foreground);
+        }
+    }
+
+    private void ApplyClientRefresh(
+        IReadOnlyList<EveClientWindow> discoveredClients,
+        nint foreground,
+        bool showOverlayAfterRefresh,
+        bool forceFullRefresh)
+    {
+        var profile = Settings.ActiveProfileFast();
+        var clients = SortClients(discoveredClients, profile).ToArray();
+
+        if (clients.Any(client => client.Handle == foreground))
+        {
+            _activeClientHandle = foreground;
+        }
+
+        if (_activeClientHandle != nint.Zero && clients.All(client => client.Handle != _activeClientHandle))
+        {
+            _activeClientHandle = nint.Zero;
+        }
+
+        var activeHandle = _activeClientHandle != nint.Zero ? _activeClientHandle : foreground;
+        clients = clients
+            .Select(client => client with { IsForeground = client.Handle == activeHandle })
+            .ToArray();
+
+        var topologySignature = ClientTopologySignature(clients);
+        var stateSignature = ClientStateSignature(clients, foreground);
+        var topologyChanged = forceFullRefresh || !string.Equals(topologySignature, _lastClientTopologySignature, StringComparison.Ordinal);
+        var stateChanged = !string.Equals(stateSignature, _lastClientStateSignature, StringComparison.Ordinal);
+
+        _clients = clients;
+        _lastClientTopologySignature = topologySignature;
+        _lastClientStateSignature = stateSignature;
+        _alerts.SetActiveCharacters(_clients.Select(client => client.CharacterName));
+
+        if (topologyChanged)
+        {
+            AutoRestoreClientLayouts(profile, _clients);
+            _overlay.SetClients(_clients, profile, foreground, activeHandle: activeHandle);
+            _overlay.ConfigureHotkeys(profile, _clients, Settings.HotkeysSuspended);
+        }
+        else
+        {
+            _overlay.SyncClientStates(_clients, foreground, activeHandle);
+        }
+
+        if (showOverlayAfterRefresh) ShowOverlay();
+        if (topologyChanged || stateChanged) PostState();
+    }
+
+    private static string ClientTopologySignature(IReadOnlyList<EveClientWindow> clients)
+    {
+        return string.Join(";", clients.Select(client => $"{client.Handle:X}|{client.ProcessId}|{client.Title}|{client.CharacterName}"));
+    }
+
+    private static string ClientStateSignature(IReadOnlyList<EveClientWindow> clients, nint foreground)
+    {
+        return $"{foreground:X}:" + string.Join(";", clients.Select(client => $"{client.Handle:X}|{client.IsMinimized}|{client.IsForeground}"));
     }
 
     private static IEnumerable<EveClientWindow> SortClients(IReadOnlyList<EveClientWindow> clients, TriffViewProfile profile)
@@ -327,12 +409,17 @@ internal sealed class TriffViewController : IDisposable
 
     private void ActivateClient(EveClientWindow client)
     {
+        ActivateClient(client, Settings.ActiveProfileFast());
+    }
+
+    private void ActivateClient(EveClientWindow client, TriffViewProfile profile)
+    {
         try
         {
-            var profile = Settings.ActiveProfile();
             var previousClient = ResolvePreviousActiveClient(client.Handle);
+            if (!ActivateWindow(client, profile)) return;
+
             _activeClientHandle = client.Handle;
-            ActivateWindow(client, profile);
             MarkActiveClient(client.Handle);
 
             if (ShouldMinimizePreviousClient(profile, previousClient, client.Handle))
@@ -381,7 +468,7 @@ internal sealed class TriffViewController : IDisposable
     private void SaveClientLayouts()
     {
         var profile = Settings.ActiveProfile();
-        foreach (var client in _tracker.GetClients(TriffViewNativeMethods.GetForegroundWindow()))
+        foreach (var client in GetTrackedClients(TriffViewNativeMethods.GetForegroundWindow()))
         {
             if (!TriffViewNativeMethods.GetWindowPlacement(client.Handle, out var placement)) continue;
             var normal = placement.NormalPosition;
@@ -404,7 +491,7 @@ internal sealed class TriffViewController : IDisposable
     private void RestoreClientLayouts()
     {
         var profile = Settings.ActiveProfile();
-        foreach (var client in _tracker.GetClients(TriffViewNativeMethods.GetForegroundWindow()))
+        foreach (var client in GetTrackedClients(TriffViewNativeMethods.GetForegroundWindow()))
         {
             RestoreClientLayout(profile, client);
         }
@@ -470,7 +557,7 @@ internal sealed class TriffViewController : IDisposable
 
     private void CloseClients()
     {
-        foreach (var client in _tracker.GetClients(TriffViewNativeMethods.GetForegroundWindow()))
+        foreach (var client in GetTrackedClients(TriffViewNativeMethods.GetForegroundWindow()))
         {
             TriffViewNativeMethods.PostMessage(client.Handle, TriffViewNativeMethods.WmClose, nint.Zero, nint.Zero);
         }
@@ -510,7 +597,7 @@ internal sealed class TriffViewController : IDisposable
 
     private void HandleHotkey(TriffViewHotkeyCommand command)
     {
-        var profile = Settings.ActiveProfile();
+        var profile = Settings.ActiveProfileFast();
         if (Settings.HotkeysSuspended) return;
         var foreground = TriffViewNativeMethods.GetForegroundWindow();
         if (profile.HotkeysRequireEveForeground
@@ -527,19 +614,18 @@ internal sealed class TriffViewController : IDisposable
             var target = _clients.FirstOrDefault(client => characterNames.Any(characterName =>
                 string.Equals(client.CharacterName, characterName, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(client.StableKey, characterName, StringComparison.OrdinalIgnoreCase)));
-            if (target != null) ActivateClient(target);
+            if (target != null) ActivateClient(target, profile);
             return;
         }
 
         if (command.Kind == TriffViewHotkeyKind.Cycle)
         {
-            CycleClient(command.GroupId, command.Direction);
+            CycleClient(profile, command.GroupId, command.Direction);
         }
     }
 
-    private void CycleClient(string groupId, int direction)
+    private void CycleClient(TriffViewProfile profile, string groupId, int direction)
     {
-        var profile = Settings.ActiveProfile();
         var group = profile.CycleGroups.FirstOrDefault(item => string.Equals(item.Id, groupId, StringComparison.OrdinalIgnoreCase));
         var cycleNames = group?.Characters.Count > 0 ? group.Characters : profile.CharacterOrder;
         if (cycleNames.Count == 0) return;
@@ -555,7 +641,7 @@ internal sealed class TriffViewController : IDisposable
         var nextIndex = activeIndex < 0
             ? 0
             : (activeIndex + direction + candidates.Count) % candidates.Count;
-        ActivateClient(candidates[nextIndex]);
+        ActivateClient(candidates[nextIndex], profile);
     }
 
     private List<EveClientWindow> ResolveCycleCandidates(IReadOnlyList<string> cycleNames)
@@ -787,28 +873,51 @@ internal sealed class TriffViewController : IDisposable
     private void OnAlertTriggered(object? sender, TriffAlertEvent alert)
     {
         if (_disposed) return;
-        _dispatcher.InvokeAsync(() =>
+        _pendingAlerts.Enqueue(alert);
+        SchedulePendingAlertDispatch();
+    }
+
+    private void SchedulePendingAlertDispatch()
+    {
+        if (Interlocked.CompareExchange(ref _alertDispatchScheduled, 1, 0) != 0) return;
+        _dispatcher.InvokeAsync(ProcessPendingAlerts, DispatcherPriority.Input);
+    }
+
+    private void ProcessPendingAlerts()
+    {
+        try
         {
             if (_disposed) return;
-            var config = Settings.Alerts.Event(alert.Type);
-            if (config.FlashEnabled)
+
+            while (_pendingAlerts.TryDequeue(out var alert))
             {
-                _overlay.ShowAlert(alert.CharacterName, new TriffViewPreviewAlert(
-                    config.SeverityRank,
-                    config.FlashColor,
-                    config.FlashThickness,
-                    config.FlashDurationMs,
-                    config.FlashPulseCount
-                ));
+                var config = Settings.Alerts.Events.TryGetValue(alert.Type, out var configured)
+                    ? configured
+                    : Settings.Alerts.Event(alert.Type);
+                if (config.FlashEnabled)
+                {
+                    _overlay.ShowAlert(alert.CharacterName, new TriffViewPreviewAlert(
+                        config.SeverityRank,
+                        config.FlashColor,
+                        config.FlashThickness,
+                        config.FlashDurationMs,
+                        config.FlashPulseCount
+                    ));
+                }
+
+                if (config.TrayNotification)
+                {
+                    AlertNotificationRequested?.Invoke(alert);
+                }
             }
 
-            if (config.TrayNotification)
-            {
-                AlertNotificationRequested?.Invoke(alert);
-            }
-
-            PostState(force: true);
-        });
+            ScheduleSwitchStatePost();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _alertDispatchScheduled, 0);
+            if (!_pendingAlerts.IsEmpty && !_disposed) SchedulePendingAlertDispatch();
+        }
     }
 
     private static void ApplyProfilePreviewSizeToSavedLayouts(TriffViewProfile profile)
@@ -1602,30 +1711,40 @@ internal sealed class TriffViewController : IDisposable
     {
         if (_clients.Count == 0) return;
 
-        var foreground = TriffViewNativeMethods.GetForegroundWindow();
         _clients = _clients
             .Select(client => client with { IsForeground = client.Handle == activeHandle })
             .ToArray();
+        _lastClientStateSignature = ClientStateSignature(_clients, activeHandle);
 
-        _overlay.SetClients(_clients, Settings.ActiveProfile(), foreground, suppressLostFocusHide: true, activeHandle: activeHandle);
-        PostState();
+        _overlay.MarkActiveClient(activeHandle);
+        ScheduleSwitchStatePost();
     }
 
-    private void ActivateWindow(EveClientWindow client, TriffViewProfile profile)
+    private void ScheduleSwitchStatePost()
     {
-        TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+        _switchStateTimer.Stop();
+        _switchStateTimer.Start();
+    }
+
+    private bool ActivateWindow(EveClientWindow client, TriffViewProfile profile)
+    {
+        var activated = TriffViewNativeMethods.SetForegroundWindow(client.Handle);
         TriffViewNativeMethods.SetFocus(client.Handle);
 
         if (profile.AlwaysMaximizeClients)
         {
             TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwMaximize);
-            return;
+            activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+            return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
         }
 
         if (TriffViewNativeMethods.IsIconic(client.Handle))
         {
             TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwRestore);
+            activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
         }
+
+        return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
     }
 
     private void PostError(string action, string message)
@@ -1790,6 +1909,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     private readonly Forms.Timer _alertTimer = new() { Interval = 80 };
     private readonly TriffViewLabelOverlayForm _labelOverlay = new();
     private string _hotkeySignature = "";
+    private string _windowRegionSignature = "";
     private int _nextHotkeyId = 3000;
     private PreviewState? _mousePreview;
     private MouseMode _mouseMode = MouseMode.None;
@@ -1937,6 +2057,108 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         );
     }
 
+    public void MarkActiveClient(nint activeHandle)
+    {
+        if (activeHandle == nint.Zero) return;
+        _foreground = activeHandle;
+        _clients = _clients
+            .Select(client => client with { IsForeground = client.Handle == activeHandle })
+            .ToArray();
+        var restoreFromLostFocus = _suppressLabelOverlay;
+        if (restoreFromLostFocus)
+        {
+            Opacity = Math.Max(0.2, Math.Min(1, _profile.Opacity));
+            _suppressLabelOverlay = false;
+        }
+
+        if (_profile.HideActivePreview)
+        {
+            SyncHiddenActivePreview(activeHandle);
+            return;
+        }
+
+        foreach (var state in _previews.Values)
+        {
+            var active = state.Client.Handle == activeHandle;
+            if (state.Active == active && state.Client.IsForeground == active) continue;
+
+            state.Active = active;
+            state.Client = state.Client with { IsForeground = active };
+            Invalidate(ToClientRect(state.FrameRect));
+        }
+
+        if (restoreFromLostFocus)
+        {
+            UpdateWindowRegion();
+            RefreshLabelOverlay();
+        }
+    }
+
+    public void SyncClientStates(IReadOnlyList<EveClientWindow> clients, nint foreground, nint activeHandle)
+    {
+        _clients = clients;
+        _foreground = foreground;
+
+        if (_profile.HideActivePreview)
+        {
+            SyncHiddenActivePreview(activeHandle);
+            return;
+        }
+
+        var clientsByHandle = clients.ToDictionary(client => client.Handle);
+        foreach (var state in _previews.Values)
+        {
+            if (!clientsByHandle.TryGetValue(state.Client.Handle, out var client)) continue;
+            var active = state.Client.Handle == activeHandle;
+            var changed = state.Active != active || state.Client != client;
+            state.Client = client;
+            state.Active = active;
+            if (changed) Invalidate(ToClientRect(state.FrameRect));
+        }
+
+        var shouldHideForLostFocus = _profile.HideOnLostFocus && clients.All(client => client.Handle != foreground);
+        if (_suppressLabelOverlay == shouldHideForLostFocus) return;
+
+        Opacity = shouldHideForLostFocus ? 0 : Math.Max(0.2, Math.Min(1, _profile.Opacity));
+        _suppressLabelOverlay = shouldHideForLostFocus;
+        UpdateWindowRegion(shouldHideForLostFocus);
+        RefreshLabelOverlay();
+    }
+
+    private void SyncHiddenActivePreview(nint activeHandle)
+    {
+        foreach (var handle in _previews.Keys.Where(handle => handle == activeHandle).ToArray())
+        {
+            _previews[handle].Thumbnail.Dispose();
+            _previews.Remove(handle);
+        }
+
+        var visibleIndex = 0;
+        foreach (var client in _clients)
+        {
+            if (client.Handle == activeHandle) continue;
+
+            if (!_previews.TryGetValue(client.Handle, out var state))
+            {
+                state = new PreviewState(client, CreateThumbnail(client.Handle))
+                {
+                    FrameRect = ResolveFrameRect(client, visibleIndex),
+                };
+                _previews[client.Handle] = state;
+            }
+
+            state.Client = client;
+            state.Active = false;
+            state.Visible = DwmAvailable;
+            UpdateThumbnail(state);
+            visibleIndex++;
+        }
+
+        UpdateWindowRegion();
+        RefreshLabelOverlay();
+        Invalidate();
+    }
+
     public void ShowAlert(string characterName, TriffViewPreviewAlert alert)
     {
         if (string.IsNullOrWhiteSpace(characterName)) return;
@@ -2016,6 +2238,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         }
 
         _previews.Clear();
+        _windowRegionSignature = "";
         _alertTimer.Stop();
         _labelOverlay.SetItems(Array.Empty<TriffViewLabelOverlayItem>());
         UpdateWindowRegion();
@@ -2106,6 +2329,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             _mousePreview.FrameRect = Snap(next, _mousePreview);
             UpdateThumbnail(_mousePreview);
             UpdateWindowRegion();
+            RefreshLabelOverlay();
             Invalidate();
         }
         else if (_mouseMode == MouseMode.Resize)
@@ -2116,6 +2340,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             _mousePreview.FrameRect = Snap(next, _mousePreview);
             UpdateThumbnail(_mousePreview);
             UpdateWindowRegion();
+            RefreshLabelOverlay();
             Invalidate();
         }
     }
@@ -2200,7 +2425,6 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         var thumbRect = ThumbnailRect(state.FrameRect);
         thumbRect.Offset(-_virtualDesktop.Left, -_virtualDesktop.Top);
         state.Thumbnail.Update(thumbRect, 255, state.Visible);
-        RefreshLabelOverlay();
     }
 
     private void RefreshLabelOverlay()
@@ -2364,6 +2588,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
     private void UpdateWindowRegion(bool forceEmpty = false)
     {
+        var signature = forceEmpty
+            ? "empty"
+            : string.Join(";", _previews.Values
+                .Where(state => state.Visible)
+                .Select(state => $"{state.Client.Handle:X}:{state.FrameRect.X},{state.FrameRect.Y},{state.FrameRect.Width},{state.FrameRect.Height}"));
+        if (string.Equals(signature, _windowRegionSignature, StringComparison.Ordinal)) return;
+        _windowRegionSignature = signature;
+
         var region = new Region();
         region.MakeEmpty();
 
@@ -2964,6 +3196,12 @@ internal sealed class TriffViewSettings
     {
         Normalize();
         return Profiles.First(profile => string.Equals(profile.Id, SelectedProfileId, StringComparison.OrdinalIgnoreCase));
+    }
+
+    public TriffViewProfile ActiveProfileFast()
+    {
+        return Profiles.FirstOrDefault(profile => string.Equals(profile.Id, SelectedProfileId, StringComparison.OrdinalIgnoreCase))
+            ?? ActiveProfile();
     }
 
     private void Normalize()

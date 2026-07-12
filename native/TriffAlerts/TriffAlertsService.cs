@@ -357,22 +357,35 @@ public sealed class TriffAlertsService : IDisposable
     private static readonly TimeSpan InitialLogCutoff = TimeSpan.FromHours(12);
     private static readonly TimeSpan CharacterInactiveRetireAge = TimeSpan.FromMinutes(45);
     private static readonly TimeSpan HardRetireAge = TimeSpan.FromHours(18);
+    private static readonly TimeSpan RecoveryDiscoveryInterval = TimeSpan.FromSeconds(30);
 
     private readonly object _gate = new();
+    private readonly string _gamelogsPath;
     private readonly Dictionary<string, LogFileState> _logs = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, string> _latestLogByCharacter = new(StringComparer.OrdinalIgnoreCase);
     private readonly Dictionary<string, DateTime> _cooldowns = new(StringComparer.OrdinalIgnoreCase);
     private readonly List<TriffAlertEvent> _history = new();
     private readonly HashSet<string> _activeCharacters = new(StringComparer.OrdinalIgnoreCase);
-    private readonly ConcurrentQueue<string> _changedPaths = new();
+    private readonly ConcurrentQueue<LogFileChange> _changedPaths = new();
+    private readonly ConcurrentQueue<TriffAlertEvent> _pendingNotifications = new();
     private System.Threading.Timer? _pollTimer;
     private FileSystemWatcher? _watcher;
     private TriffAlertsSettings _settings = TriffAlertsSettings.CreateDefault();
     private bool _disposed;
-    private bool _scanRequested = true;
+    private bool _discoveryRequested = true;
     private bool _monitoring;
-    private DateTime _lastRecentScanUtc = DateTime.MinValue;
+    private DateTime _monitorStartedUtc = DateTime.MinValue;
+    private DateTime _lastDiscoveryUtc = DateTime.MinValue;
     private int _scanInProgress;
+    private int _fastReadScheduled;
+    private int _notificationDispatchScheduled;
+
+    public TriffAlertsService(string? gamelogsPath = null)
+    {
+        _gamelogsPath = string.IsNullOrWhiteSpace(gamelogsPath)
+            ? DefaultGamelogsPath
+            : Path.GetFullPath(gamelogsPath);
+    }
 
     public event EventHandler<TriffAlertEvent>? AlertTriggered;
 
@@ -448,18 +461,35 @@ public sealed class TriffAlertsService : IDisposable
     {
         if (_monitoring || _disposed) return;
         _monitoring = true;
-        _scanRequested = true;
-        Directory.CreateDirectory(GamelogsPath);
-        _watcher = new FileSystemWatcher(GamelogsPath, "*.txt")
+        _monitorStartedUtc = DateTime.UtcNow;
+        _discoveryRequested = true;
+        Directory.CreateDirectory(_gamelogsPath);
+
+        _watcher = new FileSystemWatcher(_gamelogsPath, "*.txt")
         {
             IncludeSubdirectories = false,
             NotifyFilter = NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
-            EnableRaisingEvents = true,
+            InternalBufferSize = 64 * 1024,
         };
-        _watcher.Created += (_, eventArgs) => QueueScan(eventArgs.FullPath);
-        _watcher.Changed += (_, eventArgs) => QueueScan(eventArgs.FullPath);
-        _watcher.Renamed += (_, eventArgs) => QueueScan(eventArgs.FullPath);
-        _pollTimer = new System.Threading.Timer(_ => Poll(), null, TimeSpan.FromMilliseconds(350), TimeSpan.FromMilliseconds(700));
+        _watcher.Created += (_, eventArgs) => QueueFastRead(eventArgs.FullPath, liveFromStart: true);
+        _watcher.Changed += (_, eventArgs) => QueueFastRead(eventArgs.FullPath, liveFromStart: false);
+        _watcher.Renamed += (_, eventArgs) => QueueFastRead(eventArgs.FullPath, liveFromStart: true);
+        _watcher.Error += (_, _) => RequestRecoveryDiscovery();
+        _watcher.EnableRaisingEvents = true;
+
+        try
+        {
+            ScanRecentLogsLocked();
+            ReadTrackedLogsLocked();
+            RetireStaleLogsLocked();
+            _lastDiscoveryUtc = DateTime.UtcNow;
+            _discoveryRequested = false;
+        }
+        catch
+        {
+            _discoveryRequested = true;
+        }
+        _pollTimer = new System.Threading.Timer(_ => Poll(), null, TimeSpan.FromMilliseconds(150), TimeSpan.FromSeconds(1));
     }
 
     private void StopMonitoringLocked()
@@ -475,11 +505,67 @@ public sealed class TriffAlertsService : IDisposable
         while (_changedPaths.TryDequeue(out _)) { }
     }
 
-    private void QueueScan(string path)
+    private void QueueFastRead(string path, bool liveFromStart)
     {
         if (string.IsNullOrWhiteSpace(path)) return;
-        _changedPaths.Enqueue(path);
-        _scanRequested = true;
+        _changedPaths.Enqueue(new LogFileChange(path, liveFromStart));
+        ScheduleFastRead();
+    }
+
+    private void RequestRecoveryDiscovery()
+    {
+        lock (_gate)
+        {
+            if (_disposed || !_monitoring) return;
+            _discoveryRequested = true;
+        }
+    }
+
+    private void ScheduleFastRead()
+    {
+        if (Interlocked.CompareExchange(ref _fastReadScheduled, 1, 0) != 0) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static service => service.DrainChangedPaths(), this, preferLocal: false);
+    }
+
+    private void DrainChangedPaths()
+    {
+        try
+        {
+            while (true)
+            {
+                var pending = new Dictionary<string, bool>(StringComparer.OrdinalIgnoreCase);
+                while (_changedPaths.TryDequeue(out var change))
+                {
+                    pending[change.Path] = pending.TryGetValue(change.Path, out var existing)
+                        ? existing || change.LiveFromStart
+                        : change.LiveFromStart;
+                }
+
+                if (pending.Count == 0) return;
+
+                lock (_gate)
+                {
+                    if (_disposed || !_monitoring || !_settings.Enabled) return;
+
+                    foreach (var (path, liveFromStart) in pending)
+                    {
+                        TrackFileLocked(path, liveFromStart || IsFileFromCurrentMonitoringSession(path));
+                    }
+
+                    ReadTrackedLogsLocked(pending.Keys);
+                    RetireStaleLogsLocked();
+                }
+            }
+        }
+        catch
+        {
+            RequestRecoveryDiscovery();
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _fastReadScheduled, 0);
+            if (!_changedPaths.IsEmpty) ScheduleFastRead();
+        }
     }
 
     private void Poll()
@@ -490,16 +576,11 @@ public sealed class TriffAlertsService : IDisposable
             lock (_gate)
             {
                 if (_disposed || !_monitoring || !_settings.Enabled) return;
-                if (_scanRequested || DateTime.UtcNow - _lastRecentScanUtc > TimeSpan.FromSeconds(10))
+                if (_discoveryRequested || DateTime.UtcNow - _lastDiscoveryUtc > RecoveryDiscoveryInterval)
                 {
                     ScanRecentLogsLocked();
-                    _lastRecentScanUtc = DateTime.UtcNow;
-                    _scanRequested = false;
-                }
-
-                while (_changedPaths.TryDequeue(out var changedPath))
-                {
-                    TrackFileLocked(changedPath);
+                    _lastDiscoveryUtc = DateTime.UtcNow;
+                    _discoveryRequested = false;
                 }
 
                 ReadTrackedLogsLocked();
@@ -518,20 +599,34 @@ public sealed class TriffAlertsService : IDisposable
 
     private void ScanRecentLogsLocked()
     {
-        if (!Directory.Exists(GamelogsPath)) return;
+        if (!Directory.Exists(_gamelogsPath)) return;
 
         var cutoff = DateTime.UtcNow - InitialLogCutoff;
-        foreach (var file in Directory.EnumerateFiles(GamelogsPath, "*.txt")
+        foreach (var file in Directory.EnumerateFiles(_gamelogsPath, "*.txt")
+            .OrderByDescending(Path.GetFileName, StringComparer.OrdinalIgnoreCase)
+            .Take(MaxTrackedFiles)
             .Select(path => new FileInfo(path))
             .Where(file => file.Exists && file.LastWriteTimeUtc >= cutoff)
-            .OrderByDescending(file => file.LastWriteTimeUtc)
-            .Take(MaxTrackedFiles))
+            .OrderByDescending(file => file.CreationTimeUtc))
         {
-            TrackFileLocked(file.FullName);
+            TrackFileLocked(file.FullName, liveFromStart: false);
         }
     }
 
-    private void TrackFileLocked(string path)
+    private bool IsFileFromCurrentMonitoringSession(string path)
+    {
+        try
+        {
+            var createdUtc = File.GetCreationTimeUtc(path);
+            return createdUtc >= _monitorStartedUtc - TimeSpan.FromSeconds(2);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private void TrackFileLocked(string path, bool liveFromStart)
     {
         if (string.IsNullOrWhiteSpace(path) || _logs.ContainsKey(path)) return;
         if (!File.Exists(path)) return;
@@ -540,17 +635,27 @@ public sealed class TriffAlertsService : IDisposable
         if (info.Extension.Equals(".txt", StringComparison.OrdinalIgnoreCase) == false) return;
         _logs[path] = new LogFileState(path)
         {
+            Position = liveFromStart ? 0 : info.Length,
+            SessionStartedUtc = info.CreationTimeUtc,
             LastWriteUtc = info.LastWriteTimeUtc,
         };
     }
 
-    private void ReadTrackedLogsLocked()
+    private void ReadTrackedLogsLocked(IEnumerable<string>? paths = null)
     {
-        foreach (var state in _logs.Values.ToArray())
+        var states = paths == null
+            ? _logs.Values.ToArray()
+            : paths.Distinct(StringComparer.OrdinalIgnoreCase)
+                .Select(path => _logs.TryGetValue(path, out var state) ? state : null)
+                .Where(state => state != null)
+                .Cast<LogFileState>()
+                .ToArray();
+
+        foreach (var state in states)
         {
             if (!File.Exists(state.Path))
             {
-                _logs.Remove(state.Path);
+                RemoveTrackedLogLocked(state.Path);
                 continue;
             }
 
@@ -573,24 +678,23 @@ public sealed class TriffAlertsService : IDisposable
                     if (TryReadHeader(stream, out var listener))
                     {
                         state.CharacterName = listener;
-                        state.Position = stream.Length;
-                        _latestLogByCharacter[listener] = state.Path;
+                        if (!RegisterCharacterSessionLocked(state)) continue;
                     }
                     else
                     {
                         state.HeaderAttempts++;
                         if (state.HeaderAttempts > 12 || DateTime.UtcNow - state.FirstSeenUtc > TimeSpan.FromMinutes(2))
                         {
-                            _logs.Remove(state.Path);
+                            RemoveTrackedLogLocked(state.Path);
                         }
+                        continue;
                     }
-                    continue;
                 }
 
-                stream.Position = state.Position;
+                stream.Position = Math.Min(state.Position, stream.Length);
                 using var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
                 var appended = reader.ReadToEnd();
-                state.Position = stream.Position;
+                state.Position = stream.Length;
                 if (string.IsNullOrEmpty(appended)) continue;
 
                 ProcessTextLocked(state, appended);
@@ -604,6 +708,50 @@ public sealed class TriffAlertsService : IDisposable
                 // Same as above; do not tear down monitoring for a transient file lock.
             }
         }
+    }
+
+    private bool RegisterCharacterSessionLocked(LogFileState candidate)
+    {
+        if (!_latestLogByCharacter.TryGetValue(candidate.CharacterName, out var currentPath)
+            || !_logs.TryGetValue(currentPath, out var current))
+        {
+            _latestLogByCharacter[candidate.CharacterName] = candidate.Path;
+            return true;
+        }
+
+        if (string.Equals(current.Path, candidate.Path, StringComparison.OrdinalIgnoreCase)) return true;
+
+        var comparison = candidate.SessionStartedUtc.CompareTo(current.SessionStartedUtc);
+        if (comparison == 0)
+        {
+            comparison = string.Compare(candidate.Path, current.Path, StringComparison.OrdinalIgnoreCase);
+        }
+
+        if (comparison <= 0)
+        {
+            _logs.Remove(candidate.Path);
+            return false;
+        }
+
+        _latestLogByCharacter[candidate.CharacterName] = candidate.Path;
+        _logs.Remove(current.Path);
+        return true;
+    }
+
+    private void RemoveTrackedLogLocked(string path)
+    {
+        if (!_logs.Remove(path, out var removed)) return;
+        if (removed.CharacterName.Length == 0) return;
+        if (!_latestLogByCharacter.TryGetValue(removed.CharacterName, out var latest)
+            || !string.Equals(latest, path, StringComparison.OrdinalIgnoreCase)) return;
+
+        _latestLogByCharacter.Remove(removed.CharacterName);
+        var replacement = _logs.Values
+            .Where(state => string.Equals(state.CharacterName, removed.CharacterName, StringComparison.OrdinalIgnoreCase))
+            .OrderByDescending(state => state.SessionStartedUtc)
+            .ThenByDescending(state => state.Path, StringComparer.OrdinalIgnoreCase)
+            .FirstOrDefault();
+        if (replacement != null) _latestLogByCharacter[removed.CharacterName] = replacement.Path;
     }
 
     private void ProcessTextLocked(LogFileState state, string text)
@@ -633,14 +781,14 @@ public sealed class TriffAlertsService : IDisposable
                 && _latestLogByCharacter.TryGetValue(state.CharacterName, out var latest)
                 && !string.Equals(latest, state.Path, StringComparison.OrdinalIgnoreCase))
             {
-                _logs.Remove(state.Path);
+                RemoveTrackedLogLocked(state.Path);
                 continue;
             }
 
             var inactiveAge = now - state.LastWriteUtc;
             if (inactiveAge > HardRetireAge)
             {
-                _logs.Remove(state.Path);
+                RemoveTrackedLogLocked(state.Path);
                 continue;
             }
 
@@ -649,7 +797,7 @@ public sealed class TriffAlertsService : IDisposable
                 && !_activeCharacters.Contains(state.CharacterName)
                 && inactiveAge > CharacterInactiveRetireAge)
             {
-                _logs.Remove(state.Path);
+                RemoveTrackedLogLocked(state.Path);
             }
         }
     }
@@ -714,11 +862,30 @@ public sealed class TriffAlertsService : IDisposable
 
         _cooldowns[cooldownKey] = now;
         AppendHistoryLocked(alert);
+        _pendingNotifications.Enqueue(alert);
+        ScheduleNotificationDispatch();
+    }
 
-        ThreadPool.QueueUserWorkItem(_ =>
+    private void ScheduleNotificationDispatch()
+    {
+        if (Interlocked.CompareExchange(ref _notificationDispatchScheduled, 1, 0) != 0) return;
+        ThreadPool.UnsafeQueueUserWorkItem(static service => service.DispatchPendingNotifications(), this, preferLocal: false);
+    }
+
+    private void DispatchPendingNotifications()
+    {
+        try
         {
-            AlertTriggered?.Invoke(this, alert);
-        });
+            while (_pendingNotifications.TryDequeue(out var alert))
+            {
+                AlertTriggered?.Invoke(this, alert);
+            }
+        }
+        finally
+        {
+            Interlocked.Exchange(ref _notificationDispatchScheduled, 0);
+            if (!_pendingNotifications.IsEmpty) ScheduleNotificationDispatch();
+        }
     }
 
     private void AppendHistoryLocked(TriffAlertEvent alert)
@@ -835,8 +1002,10 @@ public sealed class TriffAlertsService : IDisposable
         };
     }
 
-    private static string GamelogsPath =>
+    private static string DefaultGamelogsPath =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), "EVE", "logs", "Gamelogs");
+
+    private readonly record struct LogFileChange(string Path, bool LiveFromStart);
 
     private sealed class LogFileState(string path)
     {
@@ -845,6 +1014,7 @@ public sealed class TriffAlertsService : IDisposable
         public long Position { get; set; }
         public string PartialLine { get; set; } = "";
         public DateTime FirstSeenUtc { get; } = DateTime.UtcNow;
+        public DateTime SessionStartedUtc { get; set; } = DateTime.UtcNow;
         public DateTime LastWriteUtc { get; set; } = DateTime.UtcNow;
         public int HeaderAttempts { get; set; }
     }
