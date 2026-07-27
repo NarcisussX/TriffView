@@ -1478,8 +1478,7 @@ function TriffViewSettings({ open = true }) {
             <DraftControl
               label="Width"
               type="number"
-              min="120"
-              max="1200"
+              min="16"
               value={profile.previewWidth || 320}
               parse={parseInteger}
               onCommit={(value) => patchProfile({ previewWidth: value })}
@@ -1487,8 +1486,7 @@ function TriffViewSettings({ open = true }) {
             <DraftControl
               label="Height"
               type="number"
-              min="90"
-              max="900"
+              min="16"
               value={profile.previewHeight || 204}
               parse={parseInteger}
               onCommit={(value) => patchProfile({ previewHeight: value })}

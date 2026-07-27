@@ -13,6 +13,12 @@ using Forms = System.Windows.Forms;
 
 namespace TriffView.Preview;
 
+internal static class TriffViewPreviewDimensions
+{
+    public const int Minimum = 16;
+    public const int Maximum = 32767;
+}
+
 internal sealed class TriffViewController : IDisposable
 {
     private const int SwitchSettleBeforeMinimizeMs = 10;
@@ -676,12 +682,20 @@ internal sealed class TriffViewController : IDisposable
                     profile.Name = value?.GetValue<string>()?.Trim() ?? profile.Name;
                     break;
                 case "previewWidth":
-                    var previewWidth = ClampInt(value, 120, 1200, profile.PreviewWidth);
+                    var previewWidth = ClampInt(
+                        value,
+                        TriffViewPreviewDimensions.Minimum,
+                        TriffViewPreviewDimensions.Maximum,
+                        profile.PreviewWidth);
                     previewSizeChanged |= previewWidth != profile.PreviewWidth;
                     profile.PreviewWidth = previewWidth;
                     break;
                 case "previewHeight":
-                    var previewHeight = ClampInt(value, 90, 900, profile.PreviewHeight);
+                    var previewHeight = ClampInt(
+                        value,
+                        TriffViewPreviewDimensions.Minimum,
+                        TriffViewPreviewDimensions.Maximum,
+                        profile.PreviewHeight);
                     previewSizeChanged |= previewHeight != profile.PreviewHeight;
                     profile.PreviewHeight = previewHeight;
                     break;
@@ -1130,8 +1144,14 @@ internal sealed class TriffViewController : IDisposable
 
         if (TryParseSize(JsonString(root, "ThumbnailSize"), out var previewSize))
         {
-            profile.PreviewWidth = Math.Max(120, previewSize.Width);
-            profile.PreviewHeight = Math.Max(90, previewSize.Height);
+            profile.PreviewWidth = Math.Clamp(
+                previewSize.Width,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
+            profile.PreviewHeight = Math.Clamp(
+                previewSize.Height,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
         }
 
         profile.Opacity = Math.Max(0.2, Math.Min(1, JsonDouble(root, "ThumbnailsOpacity", profile.Opacity)));
@@ -1174,8 +1194,14 @@ internal sealed class TriffViewController : IDisposable
         if (TryReadEveXRect(root["Thumbnail Positions"] as JsonObject, out var firstPreviewRect)
             || TryParseEveXRect(globalSettings?["ThumbnailStartLocation"] as JsonObject, out firstPreviewRect))
         {
-            profile.PreviewWidth = Math.Max(120, firstPreviewRect.Width);
-            profile.PreviewHeight = Math.Max(90, firstPreviewRect.Height);
+            profile.PreviewWidth = Math.Clamp(
+                firstPreviewRect.Width,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
+            profile.PreviewHeight = Math.Clamp(
+                firstPreviewRect.Height,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
         }
 
         if (thumbnailSettings != null)
@@ -1293,8 +1319,14 @@ internal sealed class TriffViewController : IDisposable
             {
                 X = rect.X,
                 Y = rect.Y,
-                Width = Math.Max(80, rect.Width),
-                Height = Math.Max(60, rect.Height),
+                Width = Math.Clamp(
+                    rect.Width,
+                    TriffViewPreviewDimensions.Minimum,
+                    TriffViewPreviewDimensions.Maximum),
+                Height = Math.Clamp(
+                    rect.Height,
+                    TriffViewPreviewDimensions.Minimum,
+                    TriffViewPreviewDimensions.Maximum),
             };
         }
     }
@@ -2335,8 +2367,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         else if (_mouseMode == MouseMode.Resize)
         {
             var next = _mouseStartRect;
-            next.Width = Math.Max(120, next.Width + deltaX);
-            next.Height = Math.Max(90, next.Height + deltaY);
+            next.Width = Math.Clamp(
+                next.Width + deltaX,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
+            next.Height = Math.Clamp(
+                next.Height + deltaY,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
             _mousePreview.FrameRect = Snap(next, _mousePreview);
             UpdateThumbnail(_mousePreview);
             UpdateWindowRegion();
@@ -2405,8 +2443,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         }
 
         var primary = ScreenGeometry.PrimaryScreenPixels();
-        var width = Math.Max(120, _profile.PreviewWidth);
-        var height = Math.Max(90, _profile.PreviewHeight);
+        var width = Math.Clamp(
+            _profile.PreviewWidth,
+            TriffViewPreviewDimensions.Minimum,
+            TriffViewPreviewDimensions.Maximum);
+        var height = Math.Clamp(
+            _profile.PreviewHeight,
+            TriffViewPreviewDimensions.Minimum,
+            TriffViewPreviewDimensions.Maximum);
         var x = primary.Right - width - 18;
         var y = primary.Top + 82 + index * (height + 10);
         if (y + height > primary.Bottom - 18)
@@ -3270,8 +3314,14 @@ internal sealed class TriffViewProfile
     {
         if (string.IsNullOrWhiteSpace(Id)) Id = Guid.NewGuid().ToString("N");
         if (string.IsNullOrWhiteSpace(Name)) Name = "Profile";
-        PreviewWidth = Math.Max(120, PreviewWidth);
-        PreviewHeight = Math.Max(90, PreviewHeight);
+        PreviewWidth = Math.Clamp(
+            PreviewWidth,
+            TriffViewPreviewDimensions.Minimum,
+            TriffViewPreviewDimensions.Maximum);
+        PreviewHeight = Math.Clamp(
+            PreviewHeight,
+            TriffViewPreviewDimensions.Minimum,
+            TriffViewPreviewDimensions.Maximum);
         Opacity = Math.Max(0.2, Math.Min(1, Opacity));
         BorderThickness = Math.Max(1, Math.Min(16, BorderThickness));
         LabelFontSize = Math.Max(8, Math.Min(32, LabelFontSize));
@@ -3297,6 +3347,17 @@ internal sealed class TriffViewProfile
         }
         PreviewLabels = CleanMap(PreviewLabels);
         PreviewLayouts ??= new Dictionary<string, TriffViewRect>(StringComparer.OrdinalIgnoreCase);
+        foreach (var layout in PreviewLayouts.Values)
+        {
+            layout.Width = Math.Clamp(
+                layout.Width,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
+            layout.Height = Math.Clamp(
+                layout.Height,
+                TriffViewPreviewDimensions.Minimum,
+                TriffViewPreviewDimensions.Maximum);
+        }
         ClientPlacements ??= new Dictionary<string, TriffViewClientPlacement>(StringComparer.OrdinalIgnoreCase);
         ClientColors ??= new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     }
@@ -3430,7 +3491,8 @@ internal sealed class TriffViewRect
     public int Width { get; set; }
     public int Height { get; set; }
 
-    public bool IsUsable => Width >= 80 && Height >= 60;
+    public bool IsUsable => Width >= TriffViewPreviewDimensions.Minimum
+        && Height >= TriffViewPreviewDimensions.Minimum;
 
     public Rectangle ToRectangle() => new(X, Y, Width, Height);
 
