@@ -33,6 +33,7 @@ internal sealed class TriffViewController : IDisposable
     private readonly DispatcherTimer _timer;
     private readonly DispatcherTimer _switchStateTimer;
     private readonly TriffViewOverlayForm _overlay;
+    private readonly TriffViewNativeMethods.WinEventProc _foregroundWinEventProc;
     private bool _settingsPanelOpen;
     private bool _nativeMenuOpen;
     private bool _disposed;
@@ -45,6 +46,9 @@ internal sealed class TriffViewController : IDisposable
     private int _periodicRefreshInProgress;
     private string _lastClientTopologySignature = "";
     private string _lastClientStateSignature = "";
+    private nint _foregroundWinEventHook;
+    private bool _hasObservedForeground;
+    private bool _lastObservedForegroundWasEve;
 
     public TriffViewSettings Settings { get; }
     public bool SettingsPanelOpen => _settingsPanelOpen;
@@ -56,6 +60,7 @@ internal sealed class TriffViewController : IDisposable
         _postToHud = postToHud;
         _reassertHudTopmost = reassertHudTopmost;
         _applySettingsAlwaysOnTop = applySettingsAlwaysOnTop;
+        _foregroundWinEventProc = OnForegroundWinEvent;
         Settings = TriffViewSettings.Load();
         _overlay = new TriffViewOverlayForm();
         _overlay.ActivateRequested += ActivateClient;
@@ -93,6 +98,7 @@ internal sealed class TriffViewController : IDisposable
             _timer.Start();
         }
 
+        StartForegroundTracking();
         PostState();
     }
 
@@ -272,6 +278,7 @@ internal sealed class TriffViewController : IDisposable
         _disposed = true;
         _timer.Stop();
         _switchStateTimer.Stop();
+        StopForegroundTracking();
         _alerts.Dispose();
         _overlay.Dispose();
     }
@@ -371,6 +378,7 @@ internal sealed class TriffViewController : IDisposable
         _lastClientTopologySignature = topologySignature;
         _lastClientStateSignature = stateSignature;
         _alerts.SetActiveCharacters(_clients.Select(client => client.CharacterName));
+        ObserveForegroundTransition(foreground, _clients);
 
         if (topologyChanged)
         {
@@ -385,6 +393,65 @@ internal sealed class TriffViewController : IDisposable
 
         if (showOverlayAfterRefresh) ShowOverlay();
         if (topologyChanged || stateChanged) PostState();
+    }
+
+    private void StartForegroundTracking()
+    {
+        if (_foregroundWinEventHook != nint.Zero) return;
+        _foregroundWinEventHook = TriffViewNativeMethods.SetWinEventHook(
+            TriffViewNativeMethods.EventSystemForeground,
+            TriffViewNativeMethods.EventSystemForeground,
+            nint.Zero,
+            _foregroundWinEventProc,
+            0,
+            0,
+            TriffViewNativeMethods.WinEventOutOfContext);
+    }
+
+    private void StopForegroundTracking()
+    {
+        if (_foregroundWinEventHook == nint.Zero) return;
+        TriffViewNativeMethods.UnhookWinEvent(_foregroundWinEventHook);
+        _foregroundWinEventHook = nint.Zero;
+    }
+
+    private void OnForegroundWinEvent(
+        nint hook,
+        uint eventType,
+        nint hwnd,
+        int objectId,
+        int childId,
+        uint eventThread,
+        uint eventTime)
+    {
+        if (_disposed || eventType != TriffViewNativeMethods.EventSystemForeground || hwnd == nint.Zero) return;
+        try
+        {
+            _dispatcher.InvokeAsync(
+                () => ObserveForegroundTransition(hwnd, _clients),
+                DispatcherPriority.Send);
+        }
+        catch (InvalidOperationException)
+        {
+            // The dispatcher can reject callbacks while the app is shutting down.
+        }
+    }
+
+    private void ObserveForegroundTransition(nint foreground, IReadOnlyList<EveClientWindow> clients)
+    {
+        if (_disposed) return;
+
+        var foregroundIsEve = clients.Any(client => client.Handle == foreground);
+        var returnedToEve = _hasObservedForeground && !_lastObservedForegroundWasEve && foregroundIsEve;
+        _hasObservedForeground = true;
+        _lastObservedForegroundWasEve = foregroundIsEve;
+
+        if (!returnedToEve || !Settings.Enabled || !_overlay.Visible) return;
+
+        _activeClientHandle = foreground;
+        _overlay.MarkActiveClient(foreground);
+        ApplyTopmostPolicy(force: true);
+        _reassertHudTopmost();
     }
 
     private static string ClientTopologySignature(IReadOnlyList<EveClientWindow> clients)
@@ -2131,6 +2198,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         _clients = clients;
         _foreground = foreground;
 
+        var shouldHideForLostFocus = _profile.HideOnLostFocus && clients.All(client => client.Handle != foreground);
+        var lostFocusVisibilityChanged = _suppressLabelOverlay != shouldHideForLostFocus;
+        if (lostFocusVisibilityChanged)
+        {
+            Opacity = shouldHideForLostFocus ? 0 : Math.Max(0.2, Math.Min(1, _profile.Opacity));
+            _suppressLabelOverlay = shouldHideForLostFocus;
+        }
+
         if (_profile.HideActivePreview)
         {
             SyncHiddenActivePreview(activeHandle);
@@ -2148,11 +2223,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             if (changed) Invalidate(ToClientRect(state.FrameRect));
         }
 
-        var shouldHideForLostFocus = _profile.HideOnLostFocus && clients.All(client => client.Handle != foreground);
-        if (_suppressLabelOverlay == shouldHideForLostFocus) return;
-
-        Opacity = shouldHideForLostFocus ? 0 : Math.Max(0.2, Math.Min(1, _profile.Opacity));
-        _suppressLabelOverlay = shouldHideForLostFocus;
+        if (!lostFocusVisibilityChanged) return;
         UpdateWindowRegion(shouldHideForLostFocus);
         RefreshLabelOverlay();
     }
@@ -2186,7 +2257,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             visibleIndex++;
         }
 
-        UpdateWindowRegion();
+        UpdateWindowRegion(_suppressLabelOverlay);
         RefreshLabelOverlay();
         Invalidate();
     }
@@ -3939,14 +4010,37 @@ internal static class TriffViewNativeMethods
     public const int DwmTnpOpacity = 0x00000004;
     public const int DwmTnpVisible = 0x00000008;
     public const int DwmTnpSourceClientAreaOnly = 0x00000010;
+    public const uint EventSystemForeground = 0x0003;
+    public const uint WinEventOutOfContext = 0x0000;
     public static readonly nint HwndTop = new(0);
     public static readonly nint HwndTopmost = new(-1);
     public static readonly nint HwndNotTopmost = new(-2);
 
     public delegate bool EnumWindowsProc(nint hwnd, nint lParam);
+    public delegate void WinEventProc(
+        nint hook,
+        uint eventType,
+        nint hwnd,
+        int objectId,
+        int childId,
+        uint eventThread,
+        uint eventTime);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool EnumWindows(EnumWindowsProc callback, nint lParam);
+
+    [DllImport("user32.dll")]
+    public static extern nint SetWinEventHook(
+        uint eventMin,
+        uint eventMax,
+        nint eventHookModule,
+        WinEventProc eventProc,
+        uint processId,
+        uint threadId,
+        uint flags);
+
+    [DllImport("user32.dll")]
+    public static extern bool UnhookWinEvent(nint hook);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool IsWindowVisible(nint hwnd);

@@ -77,11 +77,11 @@ Third-party dependency, font, WebView2, and EVE/CCP trademark notices are listed
 
 ## Release Verification
 
-Current Windows release: `v1.6.1`
+Current Windows release: `v1.6.2`
 
 - File: `TriffView.exe`
-- Size: `164,043,480 bytes` (`156.44 MiB`)
-- SHA-256: `4109B2BE68F32E48A01A7914C959D28741BDE6E6BC21C606AED7C6EF0FFD37CA`
+- Size: `164,047,576 bytes` (`156.45 MiB`)
+- SHA-256: `15A1B2C953C3A7B0B29144C9CBE7AFE9FC696D6DDD0926CF505418477486D8D7`
 
 The release executable is Authenticode signed by Cooper Broderick and timestamped through Microsoft's timestamp service. The download also includes `TriffView.exe.sha256.txt` for verification.
 
