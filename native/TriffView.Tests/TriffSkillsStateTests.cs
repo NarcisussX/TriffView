@@ -18,6 +18,8 @@ public class TriffSkillsStateTests : IDisposable
 
     public void Dispose()
     {
+        // finally, so the process-global override is cleared even if cleanup throws
+        // or the directory was never created.
         try
         {
             if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
@@ -25,6 +27,10 @@ public class TriffSkillsStateTests : IDisposable
         catch (IOException)
         {
             // Best-effort cleanup.
+        }
+        finally
+        {
+            TriffSkillsPaths.ClearOverride();
         }
     }
 

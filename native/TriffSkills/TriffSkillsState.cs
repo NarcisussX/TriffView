@@ -13,6 +13,10 @@ internal static class TriffSkillsPaths
     // code never calls this.
     public static void OverrideRoot(string root) => _rootOverride = root;
 
+    // Paired with OverrideRoot: the override is process-global, so a test class that
+    // does not clear it leaves every later reader pointed at a deleted temp directory.
+    public static void ClearOverride() => _rootOverride = null;
+
     public static string Root => _rootOverride ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
         "TriffHud",
@@ -108,7 +112,7 @@ internal sealed class TriffSkillsState
             error = "";
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
             error = ex.Message;
             TryDelete(tempPath);

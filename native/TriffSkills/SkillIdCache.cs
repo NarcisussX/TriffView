@@ -65,7 +65,7 @@ internal sealed class SkillIdCache
             if (File.Exists(path)) File.Replace(temp, path, null);
             else File.Move(temp, path);
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
             Debug.WriteLine($"TriffSkills: skill id cache save failed: {ex.Message}");
             try

@@ -852,7 +852,11 @@ export default function TriffSkills() {
     setImportBusy(true);
     setImportSubmitError("");
     setImportCollision(false);
-    send("triffskills:import-plan", { name: trimmedName, contents: importDraft.contents, replace });
+    // Same guard as startClipboardImport: with no bridge the reply that clears
+    // importBusy never arrives, leaving the dialog stuck on "Importing...".
+    if (!send("triffskills:import-plan", { name: trimmedName, contents: importDraft.contents, replace })) {
+      setImportBusy(false);
+    }
   }
 
   // The "clipboard" reply is broadcast to every tool. Listening only while

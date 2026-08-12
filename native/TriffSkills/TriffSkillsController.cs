@@ -655,14 +655,32 @@ internal sealed class TriffSkillsController
 
         // Deletes only the TriffSkills-prefixed credential; Fleet Manager's entry for
         // the same character is a different target name and is left alone.
-        CredentialStore.Delete(RefreshTokenTarget(characterId));
+        // A failure here must not strand the row: the user's next Forget would hit the
+        // same failure, so the row is removed either way and the credential is reported.
+        string? credentialError = null;
+        try
+        {
+            CredentialStore.Delete(RefreshTokenTarget(characterId));
+        }
+        catch (Exception ex)
+        {
+            credentialError = ex.Message;
+        }
+
         _state.Characters.RemoveAll(character => character.CharacterId == characterId);
         if (_state.SelectedCharacterId == characterId)
         {
             _state.SelectedCharacterId = _state.Characters.FirstOrDefault()?.CharacterId ?? 0;
         }
         _accessTokens.Remove(characterId);
-        _state.Save();
+        if (!_state.TrySave(out var saveError))
+        {
+            PostError("forget", $"Could not save character state: {saveError}");
+        }
+        if (credentialError != null)
+        {
+            PostError("forget", $"The stored credential could not be deleted: {credentialError}");
+        }
         PostState(force: true);
     }
 

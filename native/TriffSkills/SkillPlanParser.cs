@@ -38,7 +38,18 @@ internal static class SkillPlanParser
                 continue;
             }
 
-            var lastSpace = line.LastIndexOf(' ');
+            // Last *whitespace*, not last ASCII space: plans pasted from web pages carry
+            // tabs and non-breaking spaces, and those lines would otherwise be skipped.
+            var lastSpace = -1;
+            for (var i = line.Length - 1; i >= 0; i--)
+            {
+                if (char.IsWhiteSpace(line[i]))
+                {
+                    lastSpace = i;
+                    break;
+                }
+            }
+
             if (lastSpace < 0)
             {
                 continue;

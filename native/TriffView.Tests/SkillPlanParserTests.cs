@@ -40,6 +40,19 @@ public class SkillPlanParserTests
         Assert.Empty(SkillPlanParser.Parse("p", line).Requirements);
     }
 
+    // Escapes rather than literal characters: a raw tab or non-breaking space in the
+    // source is invisible in review and easy to "fix" into a plain space by accident.
+    [Theory]
+    [InlineData("Survey\tIV")]
+    [InlineData("Survey\u00A0IV")]
+    [InlineData("Survey \u00A0 IV")]
+    public void SplitsOnNonAsciiWhitespace(string line)
+    {
+        var requirement = Assert.Single(SkillPlanParser.Parse("p", line).Requirements);
+        Assert.Equal("Survey", requirement.SkillName);
+        Assert.Equal(4, requirement.Level);
+    }
+
     [Fact]
     public void TrimsColumnAlignedWhitespaceFromName()
     {

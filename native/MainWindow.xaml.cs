@@ -640,9 +640,25 @@ public partial class MainWindow : Window
         // Skill Planner pay no startup or disk cost for it.
         if (type.StartsWith("triffskills:", StringComparison.Ordinal))
         {
-            _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
-            if (_triffSkills.HandleWebMessage(type, message))
+            // This is the one controller built lazily inside the event handler, so a
+            // throw here escapes into WebView2's callback and takes the app down.
+            // Report it and fall through instead.
+            try
             {
+                _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
+                if (_triffSkills.HandleWebMessage(type, message))
+                {
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                PostAppEvent(new
+                {
+                    type = "triffskills:error",
+                    action = "handle",
+                    message = $"TriffSkills failed to handle {type}: {ex.Message}",
+                });
                 return;
             }
         }

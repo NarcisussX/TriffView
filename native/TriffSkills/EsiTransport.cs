@@ -54,7 +54,11 @@ internal static class EsiTransport
                 var esiRemain = HeaderValue(response, "X-Esi-Error-Limit-Remain");
                 var esiReset = HeaderValue(response, "X-Esi-Error-Limit-Reset");
                 var retryAfter = HeaderValue(response, "Retry-After");
-                if (!string.IsNullOrWhiteSpace(esiRemain) || !string.IsNullOrWhiteSpace(esiReset) || !string.IsNullOrWhiteSpace(retryAfter))
+                // Only on failure: ESI sends these headers on successful responses too, and
+                // appending them to an empty Error would make a 200 look like a failure to
+                // every caller that tests Error for emptiness.
+                if (!response.IsSuccessStatusCode
+                    && (!string.IsNullOrWhiteSpace(esiRemain) || !string.IsNullOrWhiteSpace(esiReset) || !string.IsNullOrWhiteSpace(retryAfter)))
                 {
                     error = $"{error} ESI error limit remain={esiRemain}, reset={esiReset}, retry-after={retryAfter}".Trim();
                 }
