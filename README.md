@@ -26,6 +26,7 @@ TriffView is a standalone preview system paired with configurable log alerts, a 
 - EVE-X Preview JSON import.
 - Full TriffView settings backup export and restore.
 - Fleet Manager for saving wing/squad layouts, pre-assigning characters, restructuring live fleets, moving existing members, and sending ESI invites.
+- TriffSkills for scoring your authenticated characters against shared skill plans, with the skills each one still needs.
 - Dark themed standalone settings window with selectable GUI themes.
 - Tray controls for quick enable, disable, suspend, save, restore, reload, and quit actions.
 
@@ -40,6 +41,16 @@ TriffFleets lets you save fleet wing/squad names, pre-assign characters and role
 Build repeatable fleet templates for DPS, logi, scouts, miners, rolling crews, or whatever your multiboxing setup needs. Create the fleet in-game, detect it with the authenticated fleet boss, then let TriffFleets create or rename wings and squads, move existing members into their saved positions, invite missing characters, keep unexpected pilots in a Bench / Waiting squad, and show a clear result log for every action.
 
 Fleet Manager does not control EVE clients. It does not inject keyboard input, mouse input, chat commands, OCR, memory reads, warps, modules, or invite acceptance. Characters still accept fleet invites manually in-game.
+
+## TriffSkills Included
+
+TriffSkills shows which skill plans your characters can already fly. Authenticate a character through EVE SSO, and TriffSkills reads its trained skills and skill queue through ESI, then scores every plan as Ready, Training, or Missing in one matrix so you can see at a glance which character to fly, and what the ones that fall short are still missing.
+
+Plans are plain text in the format EVE's own skill plan window copies to the clipboard: one skill per line, name then level (`Navigation V`). Use Import from clipboard to save a plan copied from the game or shared by your corp, or drop `.txt` files into the plans folder (`Open plans folder` takes you there, `Reload plans` picks up changes without restarting). One starter plan, Core Ship Skills, is written the first time TriffSkills runs so the matrix has something to score against - delete it if you do not want it and it will not come back.
+
+TriffSkills uses the same EVE application registration as Fleet Manager, but its own consent: the login screen asks for `esi-skills.read_skills.v1` and `esi-skills.read_skillqueue.v1` and nothing else, and its sign-ins are stored separately from Fleet Manager's. If you are building TriffView against your own registration, point TriffSkills at it with the `TRIFFVIEW_TRIFFSKILLS_CLIENT_ID` environment variable.
+
+TriffSkills is read-only. It does not train skills, buy skill injectors, change your queue, or control EVE clients.
 
 ## TriffAlerts Included
 
