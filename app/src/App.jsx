@@ -8,11 +8,13 @@ import TriffViewSettings from "./tools/TriffViewSettings.jsx";
 
 const EveSettings = React.lazy(() => import("./tools/EveSettings.tsx"));
 const TriffFleets = React.lazy(() => import("./tools/TriffFleets.tsx"));
+const TriffSkills = React.lazy(() => import("./tools/TriffSkills.tsx"));
 
 const NAV_ITEMS = [
   { id: "triffview", label: "TriffView" },
   { id: "eve-settings", label: "EVE Settings" },
   { id: "fleet-manager", label: "Fleet Manager" },
+  { id: "skill-planner", label: "Skill Planner" },
 ];
 const THEME_STORAGE_KEY = "triffview.guiTheme";
 const GUI_THEMES = [
@@ -264,6 +266,11 @@ export default function App() {
         {activeTool === "fleet-manager" ? (
           <Suspense fallback={<div className="triffview-standalone-loading">Loading Fleet Manager...</div>}>
             <TriffFleets />
+          </Suspense>
+        ) : null}
+        {activeTool === "skill-planner" ? (
+          <Suspense fallback={<div className="triffview-standalone-loading">Loading Skill Planner...</div>}>
+            <TriffSkills />
           </Suspense>
         ) : null}
       </section>
