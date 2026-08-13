@@ -104,3 +104,4 @@ The release executable is Authenticode signed by Cooper Broderick and timestampe
 - [EVE-MultiPreview](https://github.com/CJKondur/EVE-MultiPreview) for the alerts idea.
 - [EVE Settings Manager](https://github.com/mintnick/eve-settings-manager) for the EVE settings management idea.
 - [Yeramel](https://www.youtube.com/@Yeramel) for the fleet management tool idea.
+- [guarzo](https://github.com/guarzo) for the Skill Planner inspiration based on CanIFly.

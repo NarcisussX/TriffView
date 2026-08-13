@@ -675,7 +675,22 @@ public partial class MainWindow : Window
 
         if (type.StartsWith("triffskills:", StringComparison.Ordinal))
         {
-            _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
+            try
+            {
+                _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to initialize Skill Planner: {ex}");
+                PostAppEvent(new
+                {
+                    type = "triffskills:error",
+                    action = "initialize",
+                    message = "Skill Planner could not be initialized.",
+                });
+                return;
+            }
+
             if (_triffSkills.HandleWebMessage(type, message))
             {
                 return;

@@ -111,7 +111,6 @@ The standalone UI uses these direct JavaScript dependencies:
 - React 18.3.1 - MIT License
 - React DOM 18.3.1 - MIT License
 - Vite 6.4.3 - MIT License
-- esbuild 0.25.12 - MIT License
 - lucide-react 0.468.0 - ISC License
 
 Transitive JavaScript dependencies are recorded in `app/package-lock.json`.

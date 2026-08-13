@@ -159,6 +159,15 @@ internal sealed class TriffSkillsState
         return added;
     }
 
+    public bool TryReorderCharacters(IReadOnlyList<long> characterIds)
+    {
+        if (characterIds.Count != Characters.Count || characterIds.Distinct().Count() != Characters.Count) return false;
+        var byId = Characters.ToDictionary(character => character.CharacterId);
+        if (characterIds.Any(characterId => !byId.ContainsKey(characterId))) return false;
+        Characters = characterIds.Select(characterId => byId[characterId]).ToList();
+        return true;
+    }
+
     public void ApplyFetchSuccess(
         long characterId,
         IReadOnlyDictionary<int, int> activeLevels,

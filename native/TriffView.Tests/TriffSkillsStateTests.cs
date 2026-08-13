@@ -79,6 +79,21 @@ public class TriffSkillsStateTests : IDisposable
     }
 
     [Fact]
+    public void CharacterOrderValidatesAndPersists()
+    {
+        var state = new TriffSkillsState();
+        state.Upsert(1).CharacterName = "First";
+        state.Upsert(2).CharacterName = "Second";
+        state.Upsert(3).CharacterName = "Third";
+
+        Assert.False(state.TryReorderCharacters([3, 3, 1]));
+        Assert.Equal([1L, 2L, 3L], state.Characters.Select(character => character.CharacterId).ToArray());
+        Assert.True(state.TryReorderCharacters([3, 1, 2]));
+        Assert.True(state.TrySave(out var error), error);
+        Assert.Equal([3L, 1L, 2L], TriffSkillsState.Load().State.Characters.Select(character => character.CharacterId).ToArray());
+    }
+
+    [Fact]
     public void PathsUseStandaloneTriffViewNamespace()
     {
         TriffSkillsPaths.ClearOverride();

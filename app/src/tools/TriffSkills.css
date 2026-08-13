@@ -5,6 +5,7 @@
   height: 100%;
   min-height: 0;
   overflow: hidden;
+  font-size: 13px;
 }
 
 .triffskills .triffview-section-content {
@@ -25,7 +26,7 @@
 .triffskills-panel p {
   margin: 4px 0 0;
   color: var(--tv-muted);
-  font-size: 11px;
+  font-size: 13px;
   line-height: 1.45;
 }
 
@@ -48,9 +49,9 @@
 }
 
 .triffskills button {
-  min-height: 28px;
+  min-height: 30px;
   padding: 4px 8px;
-  font-size: 11px;
+  font-size: 13px;
   font-weight: 800;
 }
 
@@ -85,7 +86,7 @@
   background: var(--tv-control-bg-alt);
   padding: 7px 9px;
   color: var(--tv-warning-text);
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .triffskills-notice.is-error {
@@ -125,7 +126,7 @@
   flex-wrap: wrap;
   gap: 5px 12px;
   color: var(--tv-muted);
-  font-size: 10px;
+  font-size: 13px;
 }
 
 .triffskills-legend span {
@@ -151,7 +152,7 @@
   border: 1px dashed var(--tv-border-dashed);
   padding: 18px;
   color: var(--tv-muted);
-  font-size: 12px;
+  font-size: 13px;
 }
 
 .triffskills-matrix-scroll {
@@ -168,7 +169,7 @@
   border-collapse: separate;
   border-spacing: 0;
   table-layout: fixed;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .triffskills-matrix th,
@@ -183,7 +184,7 @@
   top: 0;
   z-index: 2;
   width: 30px;
-  height: 128px;
+  height: 140px;
   background: var(--tv-table-head-bg);
   vertical-align: bottom;
 }
@@ -196,6 +197,19 @@
   white-space: nowrap;
   writing-mode: vertical-rl;
   transform: rotate(180deg);
+}
+
+.triffskills-matrix thead th[draggable="true"] {
+  cursor: grab;
+}
+
+.triffskills-matrix thead th.is-dragging {
+  opacity: 0.45;
+}
+
+.triffskills-matrix thead th.is-drag-target {
+  outline: 2px solid var(--tv-accent);
+  outline-offset: -2px;
 }
 
 .triffskills-matrix thead th.has-warning {
@@ -236,12 +250,13 @@
 .triffskills-matrix tbody th small {
   float: right;
   color: var(--tv-muted);
+  font-size: 12px;
   font-variant-numeric: tabular-nums;
 }
 
 .triffskills-matrix td {
   width: 30px;
-  height: 28px;
+  height: 32px;
   background: var(--tv-control-bg);
 }
 
@@ -251,7 +266,7 @@
   border: 0 !important;
   background: transparent !important;
   padding: 0 !important;
-  font-size: 14px !important;
+  font-size: 16px !important;
 }
 
 .triffskills-cell:hover,
@@ -267,7 +282,7 @@
   border: 1px solid var(--tv-border-soft);
   background: var(--tv-control-bg-alt);
   padding: 9px 10px;
-  font-size: 11px;
+  font-size: 13px;
 }
 
 .triffskills-issues summary {
@@ -288,7 +303,7 @@
 .triffskills-panel h3 {
   margin: 0 0 7px;
   color: var(--tv-text-strong);
-  font-size: 12px;
+  font-size: 14px;
   text-transform: uppercase;
 }
 
@@ -320,6 +335,7 @@
 .triffskills-character small,
 .triffskills-detail small {
   color: var(--tv-muted);
+  font-size: 12px;
 }
 
 .triffskills-character p.is-error {

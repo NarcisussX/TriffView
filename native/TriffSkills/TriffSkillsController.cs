@@ -127,6 +127,9 @@ internal sealed class TriffSkillsController : IDisposable
             case "triffskills:forget-character":
                 _ = ForgetCharacterAsync(ReadLong(message, "characterId"));
                 return true;
+            case "triffskills:reorder-characters":
+                ReorderCharacters(message);
+                return true;
             case "triffskills:refresh-characters":
                 _ = RefreshCharactersAsync();
                 return true;
@@ -211,6 +214,41 @@ internal sealed class TriffSkillsController : IDisposable
         if (!result.Success)
         {
             PostError("forget", result.Error);
+        }
+        PostState(force: true);
+    }
+
+    private void ReorderCharacters(JsonObject? message)
+    {
+        if (message?["characterIds"] is not JsonArray nodes || nodes.Count > TriffSkillsState.MaxCharacters)
+        {
+            PostError("reorder-characters", "Character order was invalid.");
+            return;
+        }
+
+        var characterIds = new List<long>(nodes.Count);
+        foreach (var node in nodes)
+        {
+            if (node is not JsonValue value || !value.TryGetValue<long>(out var characterId) || characterId <= 0)
+            {
+                PostError("reorder-characters", "Character order was invalid.");
+                return;
+            }
+            characterIds.Add(characterId);
+        }
+
+        var previous = _state.Characters;
+        if (!_state.TryReorderCharacters(characterIds))
+        {
+            PostError("reorder-characters", "Character order no longer matched the current characters.");
+            PostState(force: true);
+            return;
+        }
+
+        if (_saveState() is not null)
+        {
+            _state.Characters = previous;
+            PostError("reorder-characters", "Character order could not be saved.");
         }
         PostState(force: true);
     }

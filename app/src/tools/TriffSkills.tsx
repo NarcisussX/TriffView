@@ -140,6 +140,8 @@ export default function TriffSkills() {
   const [previewRequest, setPreviewRequest] = useState("");
   const [commitRequest, setCommitRequest] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
+  const [draggedCharacterId, setDraggedCharacterId] = useState<number | null>(null);
+  const [dragTargetCharacterId, setDragTargetCharacterId] = useState<number | null>(null);
   const detailRequestRef = useRef("");
   const inputRevisionRef = useRef(0);
   const previewRequestRef = useRef<{ requestId: string; revision: number } | null>(null);
@@ -242,6 +244,18 @@ export default function TriffSkills() {
     );
   }
 
+  function reorderCharacters(sourceId: number, targetId: number) {
+    if (sourceId === targetId) return;
+    const sourceIndex = state.characters.findIndex((character) => character.characterId === sourceId);
+    const targetIndex = state.characters.findIndex((character) => character.characterId === targetId);
+    if (sourceIndex < 0 || targetIndex < 0) return;
+    const characters = [...state.characters];
+    const [moved] = characters.splice(sourceIndex, 1);
+    characters.splice(targetIndex, 0, moved);
+    setState((current) => ({ ...current, characters }));
+    send("triffskills:reorder-characters", { characterIds: characters.map((character) => character.characterId) });
+  }
+
   function previewPlan() {
     setError("");
     previewRef.current = null;
@@ -330,8 +344,35 @@ export default function TriffSkills() {
                     <tr>
                       <th className="triffskills-plan-heading" scope="col">Plan</th>
                       {state.characters.map((character) => (
-                        <th scope="col" className={character.error ? "has-warning" : ""} key={character.characterId}>
-                          <span title={character.characterName}>{character.characterName}</span>
+                        <th
+                          scope="col"
+                          draggable
+                          className={`${character.error ? "has-warning " : ""}${draggedCharacterId === character.characterId ? "is-dragging " : ""}${dragTargetCharacterId === character.characterId ? "is-drag-target" : ""}`.trim()}
+                          key={character.characterId}
+                          onDragStart={(event) => {
+                            event.dataTransfer.effectAllowed = "move";
+                            event.dataTransfer.setData("text/plain", String(character.characterId));
+                            setDraggedCharacterId(character.characterId);
+                          }}
+                          onDragOver={(event) => {
+                            if (draggedCharacterId === null || draggedCharacterId === character.characterId) return;
+                            event.preventDefault();
+                            event.dataTransfer.dropEffect = "move";
+                            setDragTargetCharacterId(character.characterId);
+                          }}
+                          onDrop={(event) => {
+                            event.preventDefault();
+                            const sourceId = draggedCharacterId ?? Number(event.dataTransfer.getData("text/plain"));
+                            if (Number.isSafeInteger(sourceId)) reorderCharacters(sourceId, character.characterId);
+                            setDraggedCharacterId(null);
+                            setDragTargetCharacterId(null);
+                          }}
+                          onDragEnd={() => {
+                            setDraggedCharacterId(null);
+                            setDragTargetCharacterId(null);
+                          }}
+                        >
+                          <span title={`Drag to reorder ${character.characterName}`}>{character.characterName}</span>
                         </th>
                       ))}
                     </tr>
