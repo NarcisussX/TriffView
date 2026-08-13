@@ -18,7 +18,8 @@ pnpm-debug.log*
 /native/TriffView.Tests/bin/
 /native/TriffView.Tests/obj/
 /native/Assets/overlay-dist.zip
-/tests/
+/tests/**/bin/
+/tests/**/obj/
 *.user
 *.suo
 *.rsuser
