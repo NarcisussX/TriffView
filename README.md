@@ -44,8 +44,6 @@ Fleet Manager does not control EVE clients. It does not inject keyboard input, m
 
 ## TriffSkills Included
 
-## TriffSkills Included
-
 Checking a skill plan across 10, 20, or 30 characters should not mean opening 10, 20, or 30 character sheets. TriffSkills puts every authenticated character and every local skill plan into one matrix, so you can immediately see who is ready, who is training, and who still has work to do.
 
 The boxes fill as more of the plan is trained and change color based on what is holding the character back. Ready means every required skill is currently active, Training means the remaining requirements are already in the queue, and Locked catches skills that are trained but unavailable on the character’s current clone. Click any character, plan, or individual result to see the full breakdown, including missing skills, queued requirements, active and trained levels, and an ETA when EVE provides one.
