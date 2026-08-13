@@ -25,23 +25,26 @@ public class OAuthLoopbackTests
     [Fact]
     public async Task ParserAcceptsOnlyExpectedGetPathAndBoundsHeaders()
     {
-        var valid = await Parse("GET /trifffleets/callback/?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+        var valid = await Parse("GET /trifffleets/callback/?code=abc&state=xyz HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n");
         Assert.NotNull(valid);
         Assert.Equal("abc", valid!.Value.Query["code"]);
 
-        Assert.Null(await Parse("POST /trifffleets/callback/?code=abc HTTP/1.1\r\n\r\n"));
-        Assert.Null(await Parse("GET /wrong/?code=abc HTTP/1.1\r\n\r\n"));
-        await Assert.ThrowsAsync<InvalidDataException>(() => Parse("GET /trifffleets/callback/?state=a&state=b HTTP/1.1\r\n\r\n"));
-        await Assert.ThrowsAsync<InvalidDataException>(() => Parse($"GET /trifffleets/callback/ HTTP/1.1\r\nX: {new string('a', 33 * 1024)}\r\n\r\n"));
-        await Assert.ThrowsAsync<InvalidDataException>(() => Parse($"GET /trifffleets/callback/?code={new string('a', 8_193)} HTTP/1.1\r\n\r\n"));
+        Assert.Null(await Parse("POST /trifffleets/callback/?code=abc HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n"));
+        Assert.Null(await Parse("GET /wrong/?code=abc HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n"));
+        Assert.Null(await Parse("GET /trifffleets/callback/?code=abc HTTP/1.1\r\nHost: attacker.invalid\r\n\r\n"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Parse("GET /trifffleets/callback/?state=a&state=b HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Parse("GET /trifffleets/callback/?state=%ZZ HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Parse("GET /trifffleets/callback/?state=x HTTP/1.1\r\nHost: 127.0.0.1:51777\r\nHost: 127.0.0.1:51777\r\n\r\n"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Parse($"GET /trifffleets/callback/ HTTP/1.1\r\nHost: 127.0.0.1:51777\r\nX: {new string('a', 33 * 1024)}\r\n\r\n"));
+        await Assert.ThrowsAsync<InvalidDataException>(() => Parse($"GET /trifffleets/callback/?code={new string('a', 8_193)} HTTP/1.1\r\nHost: 127.0.0.1:51777\r\n\r\n"));
     }
 
     [Fact]
     public void CredentialNamespacesCannotCollide()
     {
-        Assert.NotEqual(TriffSkillsController.CredentialPrefix, TriffFleetsController.CredentialPrefix);
-        Assert.DoesNotContain(TriffSkillsController.CredentialPrefix, TriffFleetsController.CredentialPrefix, StringComparison.Ordinal);
-        Assert.DoesNotContain(TriffFleetsController.CredentialPrefix, TriffSkillsController.CredentialPrefix, StringComparison.Ordinal);
+        Assert.NotEqual(TriffSkillsAuthentication.CredentialPrefix, TriffFleetsController.CredentialPrefix);
+        Assert.DoesNotContain(TriffSkillsAuthentication.CredentialPrefix, TriffFleetsController.CredentialPrefix, StringComparison.Ordinal);
+        Assert.DoesNotContain(TriffFleetsController.CredentialPrefix, TriffSkillsAuthentication.CredentialPrefix, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -58,6 +61,6 @@ public class OAuthLoopbackTests
     private static async Task<(string Method, string Path, Dictionary<string, string> Query)?> Parse(string request)
     {
         await using var stream = new MemoryStream(Encoding.ASCII.GetBytes(request));
-        return await EveSsoClient.ParseCallbackRequestAsync(stream, Redirect, CancellationToken.None);
+        return await EveLoopbackCallback.ParseRequestAsync(stream, Redirect, CancellationToken.None);
     }
 }

@@ -1,4 +1,5 @@
 using System.IO;
+using System.Security;
 using System.Text;
 using TriffView.Eve;
 
@@ -18,7 +19,6 @@ internal static class PlanStore
     public const long MaxPlanFileBytes = 512 * 1024;
 
     private const string StarterPlanContents = """
-        # Core support skills - one skill per line, followed by level I-V or 1-5.
         CPU Management IV
         Power Grid Management IV
         Capacitor Management III
@@ -127,23 +127,33 @@ internal static class PlanStore
             return new PlanCommitResult(false, false, requestedName, null, error);
         }
 
-        Directory.CreateDirectory(plansDir);
-        var existing = FindExistingPath(plansDir, name);
-        if (existing is not null && !replace) return new PlanCommitResult(false, true, name, null, string.Empty);
-        if (existing is null && Directory.EnumerateFiles(plansDir, "*.txt").Take(MaxPlanFiles).Count() >= MaxPlanFiles)
+        var parsedContents = SkillPlanParser.Parse(name, contents);
+        if (!parsedContents.IsValid || parsedContents.Plan is null || !SameRequirements(validatedPlan, parsedContents.Plan))
         {
-            return new PlanCommitResult(false, false, name, null, $"Plan folder already contains the {MaxPlanFiles:N0}-file maximum.");
+            return new PlanCommitResult(false, false, name, null, "Plan contents no longer match the validated preview.");
         }
 
-        var path = existing ?? Path.GetFullPath(Path.Combine(plansDir, name + ".txt"));
-        if (!PlanNameValidator.IsWithin(path, plansDir))
-        {
-            return new PlanCommitResult(false, false, name, null, "Plan path escaped the plans folder.");
-        }
-
-        var existed = File.Exists(path);
+        string? path = null;
+        var existed = false;
+        var writeAttempted = false;
         try
         {
+            Directory.CreateDirectory(plansDir);
+            var existing = FindExistingPath(plansDir, name);
+            if (existing is not null && !replace) return new PlanCommitResult(false, true, name, null, string.Empty);
+            if (existing is null && Directory.EnumerateFiles(plansDir, "*.txt", SearchOption.TopDirectoryOnly).Take(MaxPlanFiles).Count() >= MaxPlanFiles)
+            {
+                return new PlanCommitResult(false, false, name, null, $"Plan folder already contains the {MaxPlanFiles:N0}-file maximum.");
+            }
+
+            path = existing ?? Path.GetFullPath(Path.Combine(plansDir, name + ".txt"));
+            if (!PlanNameValidator.IsWithin(path, plansDir))
+            {
+                return new PlanCommitResult(false, false, name, null, "Plan path escaped the plans folder.");
+            }
+
+            existed = File.Exists(path);
+            writeAttempted = true;
             AtomicFile.WriteText(path, contents.ReplaceLineEndings("\r\n"));
             var info = new FileInfo(path);
             if (info.Length > MaxPlanFileBytes) throw new InvalidDataException("Saved plan exceeded the file-size limit.");
@@ -156,6 +166,11 @@ internal static class PlanStore
         }
         catch (Exception exception) when (IsFileFailure(exception) || exception is InvalidDataException)
         {
+            if (!writeAttempted || path is null)
+            {
+                return new PlanCommitResult(false, false, name, null, $"Plan was not saved ({DescribeFailure(exception)}).");
+            }
+
             try
             {
                 if (existed) AtomicFile.RestoreBackup(path, MaxPlanFileBytes);
@@ -167,9 +182,14 @@ internal static class PlanStore
             }
             catch (Exception rollback) when (IsFileFailure(rollback))
             {
-                return new PlanCommitResult(false, false, name, null, $"Plan save failed and rollback also failed: {rollback.Message}");
+                return new PlanCommitResult(
+                    false,
+                    false,
+                    name,
+                    null,
+                    $"Plan was not saved ({DescribeFailure(exception)}); rollback also failed ({DescribeFailure(rollback)}).");
             }
-            return new PlanCommitResult(false, false, name, null, $"Plan was not saved: {exception.Message}");
+            return new PlanCommitResult(false, false, name, null, $"Plan was not saved ({DescribeFailure(exception)}); the previous file was restored.");
         }
     }
 
@@ -182,5 +202,14 @@ internal static class PlanStore
         => left.Requirements.SequenceEqual(right.Requirements);
 
     private static bool IsFileFailure(Exception exception)
-        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
+        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException or SecurityException;
+
+    private static string DescribeFailure(Exception exception) => exception switch
+    {
+        InvalidDataException => exception.Message,
+        UnauthorizedAccessException or SecurityException => "access denied",
+        ArgumentException or NotSupportedException => "invalid path",
+        IOException => "I/O error",
+        _ => "unexpected file error",
+    };
 }

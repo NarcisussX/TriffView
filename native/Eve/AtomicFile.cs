@@ -114,7 +114,6 @@ internal static class AtomicFile
         }
         catch (Exception exception) when (IsFileFailure(exception))
         {
-            // A same-directory temp file is recoverable and ignored by every reader.
         }
     }
 }

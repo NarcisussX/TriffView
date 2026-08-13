@@ -72,12 +72,30 @@ public class EveSsoLoopbackIntegrationTests : IDisposable
             () => Client(FreeRedirect(), cancelBrowser, new TokenHandler(Token())).AuthorizeAsync(TimeSpan.FromSeconds(3), cancellation.Token));
     }
 
+    [Fact]
+    public async Task SimultaneousAuthorizationFailsBeforeBindingAnotherCallbackPort()
+    {
+        var firstBrowser = new ScriptedBrowser(_ => Task.CompletedTask);
+        using var cancellation = new CancellationTokenSource();
+        var first = Client(FreeRedirect(), firstBrowser, new TokenHandler(Token()))
+            .AuthorizeAsync(TimeSpan.FromSeconds(3), cancellation.Token);
+        Assert.True(SpinWait.SpinUntil(() => !first.IsCompleted, TimeSpan.FromSeconds(1)));
+
+        var second = Client(FreeRedirect(), new ScriptedBrowser(_ => Task.CompletedTask), new TokenHandler(Token()));
+        var error = await Assert.ThrowsAsync<InvalidOperationException>(
+            () => second.AuthorizeAsync(TimeSpan.FromSeconds(3), CancellationToken.None));
+        Assert.Contains("already in progress", error.Message, StringComparison.Ordinal);
+
+        cancellation.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => first);
+    }
+
     private EveSsoClient Client(string redirect, IBrowserLauncher browser, TokenHandler handler)
     {
         var validator = new EveJwtValidator(ClientId, Scopes, new StaticKeys(_key));
         return new EveSsoClient(
             new HttpClient(handler),
-            new EveSsoOptions(ClientId, redirect, Scopes, "TriffView.Tests/1.0", "Tests"),
+            new EveSsoOptions(ClientId, redirect, Scopes, "TriffView.Tests/1.0"),
             validator,
             browser);
     }

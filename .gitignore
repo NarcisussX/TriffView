@@ -29,11 +29,15 @@ pnpm-debug.log*
 
 # Local .NET/NuGet caches
 /.dotnet/
+/.dotnet-sdk/
 /.dotnet-home/
 /.nuget/
+/.nuget-packages/
 /.appdata/
 /.nuget-cache/
 /.nuget-plugin-cache/
+/.validation-artifacts/
+/app/.npm-cache/
 
 # IDE/editor state
 /.vs/

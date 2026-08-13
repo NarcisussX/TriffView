@@ -5,8 +5,6 @@ using System.IO;
 using System.Net;
 using System.Net.Http;
 using System.Net.Sockets;
-using System.Security.Cryptography;
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using TriffView.Eve;
@@ -15,15 +13,11 @@ namespace TriffView.TriffSkills;
 
 internal sealed class TriffSkillsController : IDisposable
 {
-    internal const string CredentialPrefix = "TriffView.TriffSkills.RefreshToken.";
-    internal const string FleetCredentialPrefix = "TriffView.TriffFleets.RefreshToken.";
-    internal const int MaxBridgePayloadBytes = 600 * 1024;
     private const string DefaultClientId = "7d2454c3191c4254a4b67d8f71f2b972";
     private const string RedirectUri = "http://127.0.0.1:51777/trifffleets/callback/";
     private const string UserAgent = "TriffView/1.6.2 (+https://github.com/NarcisussX/TriffView)";
     private const int SkillCategoryId = 16;
     private static readonly TimeSpan AuthTimeout = TimeSpan.FromMinutes(5);
-    private static readonly TimeSpan PreviewLifetime = TimeSpan.FromMinutes(10);
     private static readonly HashSet<string> RequiredScopes = new(StringComparer.Ordinal)
     {
         "esi-skills.read_skills.v1",
@@ -34,10 +28,8 @@ internal sealed class TriffSkillsController : IDisposable
     private static readonly string ClientId = Environment.GetEnvironmentVariable("TRIFFVIEW_TRIFFSKILLS_CLIENT_ID")?.Trim() is { Length: > 0 } value
         ? value
         : DefaultClientId;
-    private const bool ClientIdOverrideAllowed = true;
 #else
     private const string ClientId = DefaultClientId;
-    private const bool ClientIdOverrideAllowed = false;
 #endif
 
     private static readonly HttpClient SharedHttp = new() { Timeout = TimeSpan.FromSeconds(20) };
@@ -48,19 +40,17 @@ internal sealed class TriffSkillsController : IDisposable
     };
 
     private readonly Action<object> _post;
-    private readonly ICredentialStore _credentials;
     private readonly EsiClient _esi;
-    private readonly IEveSsoClient _sso;
     private readonly TimeProvider _time;
+    private readonly TriffSkillsAuthentication _authentication;
+    private readonly PlanImportWorkflow _planImports;
+    private readonly Func<string?> _saveState;
     private readonly CancellationTokenSource _lifetime = new();
-    private readonly ConcurrentDictionary<long, SemaphoreSlim> _characterLocks = new();
     private readonly SemaphoreSlim _authGate = new(1, 1);
     private readonly SemaphoreSlim _refreshGate = new(1, 1);
     private readonly SemaphoreSlim _resolveGate = new(1, 1);
     private readonly SemaphoreSlim _resolvePassGate = new(1, 1);
-    private readonly ConcurrentDictionary<long, AccessTokenCache> _accessTokens = [];
     private readonly ConcurrentDictionary<int, int> _groupCategories = [];
-    private readonly ConcurrentDictionary<string, PendingPlanPreview> _pendingPreviews = new(StringComparer.Ordinal);
     private readonly TriffSkillsState _state;
     private readonly SkillIdCache _skillIds;
     private readonly List<string> _warnings = [];
@@ -83,23 +73,25 @@ internal sealed class TriffSkillsController : IDisposable
         ICredentialStore credentials,
         EsiClient esi,
         IEveSsoClient sso,
-        TimeProvider time)
+        TimeProvider time,
+        Func<string?>? saveState = null)
     {
         _post = post;
-        _credentials = credentials;
         _esi = esi;
-        _sso = sso;
         _time = time;
 
         var stateLoad = TriffSkillsState.Load();
         _state = stateLoad.State;
         if (!string.IsNullOrWhiteSpace(stateLoad.Warning)) _warnings.Add(stateLoad.Warning);
+        _saveState = saveState ?? (() => _state.TrySave(out var error) ? null : error);
+        _authentication = new TriffSkillsAuthentication(_state, credentials, sso, time, _saveState);
+        _planImports = new PlanImportWorkflow(TriffSkillsPaths.PlansDir, time, ResolveAndValidateNamesAsync);
 
         var cacheLoad = SkillIdCache.Load();
         _skillIds = cacheLoad.Cache;
         if (!string.IsNullOrWhiteSpace(cacheLoad.Warning)) _warnings.Add(cacheLoad.Warning);
 
-        RecoverOwnCredentials();
+        _warnings.AddRange(_authentication.RecoverOwnCredentials());
         var seedWarning = PlanStore.EnsureSeeded(TriffSkillsPaths.PlansDir);
         if (!string.IsNullOrWhiteSpace(seedWarning)) _warnings.Add(seedWarning);
         LoadPlans();
@@ -113,7 +105,7 @@ internal sealed class TriffSkillsController : IDisposable
         var validator = new EveJwtValidator(ClientId, RequiredScopes, keys);
         return new EveSsoClient(
             SharedHttp,
-            new EveSsoOptions(ClientId, RedirectUri, RequiredScopes, UserAgent, "TriffSkills"),
+            new EveSsoOptions(ClientId, RedirectUri, RequiredScopes, UserAgent),
             validator);
     }
 
@@ -164,8 +156,6 @@ internal sealed class TriffSkillsController : IDisposable
         _authCancellation?.Cancel();
         _authCancellation?.Dispose();
         _lifetime.Dispose();
-        // In-flight operations observe _lifetime and finish shortly. Their gates are
-        // intentionally left for GC so cancellation cannot race a disposed semaphore.
     }
 
     private async Task StartAuthAsync()
@@ -177,28 +167,11 @@ internal sealed class TriffSkillsController : IDisposable
         }
 
         _authInProgress = true;
-        var charactersAtStart = _state.Characters.Select(character => character.CharacterId).ToHashSet();
         _authCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         PostState(force: true);
         try
         {
-            var token = await _sso.AuthorizeAsync(AuthTimeout, _authCancellation.Token);
-            var characterId = token.Identity.CharacterId;
-            var gate = CharacterLock(characterId);
-            await gate.WaitAsync(_authCancellation.Token);
-            try
-            {
-                if (charactersAtStart.Contains(characterId) && _state.Find(characterId) is null)
-                {
-                    throw new OperationCanceledException("The character was forgotten while reauthorization was in progress.");
-                }
-                CommitAuthentication(token);
-            }
-            finally
-            {
-                gate.Release();
-            }
-
+            await _authentication.AuthorizeAsync(AuthTimeout, _authCancellation.Token);
             PostState(force: true);
             _ = RefreshCharactersAsync();
         }
@@ -232,115 +205,14 @@ internal sealed class TriffSkillsController : IDisposable
         }
     }
 
-    private void CommitAuthentication(EveValidatedToken token)
-    {
-        if (string.IsNullOrWhiteSpace(token.RefreshToken)) throw new InvalidDataException("EVE SSO returned no refresh token.");
-        var identity = token.Identity;
-        var target = CredentialTarget(identity.CharacterId);
-        var previousSecret = _credentials.Read(target);
-        var existingIndex = _state.Characters.FindIndex(character => character.CharacterId == identity.CharacterId);
-        var previousCharacter = existingIndex >= 0 ? _state.Characters[existingIndex].Clone() : null;
-        var previousSelection = _state.SelectedCharacterId;
-
-        _credentials.Write(target, token.RefreshToken);
-        try
-        {
-            var character = _state.Upsert(identity.CharacterId);
-            var ownershipChanged = !string.IsNullOrWhiteSpace(character.OwnerHash)
-                && !string.Equals(character.OwnerHash, identity.OwnerHash, StringComparison.Ordinal);
-            character.CharacterName = identity.CharacterName;
-            character.OwnerHash = identity.OwnerHash;
-            character.Scopes = identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
-            character.AuthenticatedUtc = _time.GetUtcNow();
-            character.Error = ownershipChanged ? "Character ownership changed; cached skill data was cleared." : string.Empty;
-            character.NeedsReauth = false;
-            if (ownershipChanged)
-            {
-                character.ActiveLevels.Clear();
-                character.TrainedLevels.Clear();
-                character.Queue.Clear();
-                character.FetchedUtc = null;
-            }
-            _state.SelectedCharacterId = identity.CharacterId;
-
-            if (!_state.TrySave(out var saveError))
-            {
-                throw new IOException($"Could not save character state: {saveError}");
-            }
-        }
-        catch
-        {
-            if (previousCharacter is null) _state.Characters.RemoveAll(character => character.CharacterId == identity.CharacterId);
-            else _state.Characters[existingIndex] = previousCharacter;
-            _state.SelectedCharacterId = previousSelection;
-            try
-            {
-                if (previousSecret is null) _credentials.Delete(target);
-                else _credentials.Write(target, previousSecret);
-            }
-            catch (Exception rollback)
-            {
-                _warnings.Add($"Authentication rollback could not restore the prior credential: {rollback.Message}");
-            }
-            throw;
-        }
-
-        _accessTokens[identity.CharacterId] = Cache(token);
-    }
-
     private async Task ForgetCharacterAsync(long characterId)
     {
-        if (characterId <= 0) return;
-        var gate = CharacterLock(characterId);
-        await gate.WaitAsync(_lifetime.Token);
-        try
+        var result = await _authentication.ForgetAsync(characterId, _lifetime.Token);
+        if (!result.Success)
         {
-            var character = _state.Find(characterId);
-            if (character is null) return;
-            var previousSecret = _credentials.Read(CredentialTarget(characterId));
-            try
-            {
-                _credentials.Delete(CredentialTarget(characterId));
-            }
-            catch (Exception exception)
-            {
-                character.Error = $"Credential deletion failed; the character was not forgotten. {exception.Message}";
-                PostError("forget", character.Error);
-                PostState(force: true);
-                return;
-            }
-
-            var index = _state.Characters.IndexOf(character);
-            var previous = character.Clone();
-            var previousSelection = _state.SelectedCharacterId;
-            _state.Characters.RemoveAt(index);
-            if (_state.SelectedCharacterId == characterId) _state.SelectedCharacterId = _state.Characters.FirstOrDefault()?.CharacterId ?? 0;
-            if (!_state.TrySave(out var saveError))
-            {
-                _state.Characters.Insert(index, previous);
-                _state.SelectedCharacterId = previousSelection;
-                try
-                {
-                    if (previousSecret is not null) _credentials.Write(CredentialTarget(characterId), previousSecret);
-                    previous.Error = $"Forget was rolled back because state could not be saved: {saveError}";
-                }
-                catch (Exception rollback)
-                {
-                    previous.NeedsReauth = true;
-                    previous.Error = $"Credential was deleted and state could not be saved; credential rollback also failed: {rollback.Message}";
-                }
-                PostError("forget", previous.Error);
-                PostState(force: true);
-                return;
-            }
-
-            _accessTokens.TryRemove(characterId, out _);
-            PostState(force: true);
+            PostError("forget", result.Error);
         }
-        finally
-        {
-            gate.Release();
-        }
+        PostState(force: true);
     }
 
     private async Task RefreshCharactersAsync()
@@ -396,7 +268,8 @@ internal sealed class TriffSkillsController : IDisposable
 
             var snapshot = EsiSkillMapper.ToSnapshot(skills.Value);
             _state.ApplyFetchSuccess(characterId, snapshot.ActiveLevels, snapshot.TrainedLevels, EsiSkillMapper.ToQueue(queue.Value), _time.GetUtcNow());
-            if (!_state.TrySave(out var saveError))
+            var saveError = _saveState();
+            if (saveError is not null)
             {
                 _state.ApplyFetchFailure(characterId, $"Fresh data is in memory but was not saved for offline use: {saveError}", needsReauth: false);
                 PostError("refresh-characters", $"{character.CharacterName}: state persistence failed.");
@@ -408,6 +281,7 @@ internal sealed class TriffSkillsController : IDisposable
             _state.ApplyFetchFailure(characterId, definitive
                 ? "Re-authenticate this character; EVE rejected the stored authorization."
                 : $"Could not refresh the sign-in; last-good data remains available. {exception.Message}", definitive);
+            PersistRefreshFailure(characterId);
             PostError("refresh-characters", $"{character.CharacterName}: {_state.Find(characterId)?.Error}");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -417,6 +291,7 @@ internal sealed class TriffSkillsController : IDisposable
         catch (Exception exception)
         {
             _state.ApplyFetchFailure(characterId, $"Refresh failed; last-good data remains available. {exception.Message}", needsReauth: false);
+            PersistRefreshFailure(characterId);
             PostError("refresh-characters", $"{character.CharacterName}: {_state.Find(characterId)?.Error}");
         }
     }
@@ -427,11 +302,11 @@ internal sealed class TriffSkillsController : IDisposable
         string path,
         CancellationToken cancellationToken)
     {
-        var token = await AccessTokenForAsync(characterId, forceRefresh: false, rejectedAccessToken: null, cancellationToken);
+        var token = await _authentication.AccessTokenAsync(characterId, forceRefresh: false, rejectedAccessToken: null, cancellationToken);
         var response = await _esi.SendAsync<T>(method, path, token, cancellationToken: cancellationToken);
         if (response.StatusCode != HttpStatusCode.Unauthorized) return response;
 
-        token = await AccessTokenForAsync(characterId, forceRefresh: true, rejectedAccessToken: token, cancellationToken);
+        token = await _authentication.AccessTokenAsync(characterId, forceRefresh: true, rejectedAccessToken: token, cancellationToken);
         return await _esi.SendAsync<T>(method, path, token, cancellationToken: cancellationToken);
     }
 
@@ -449,87 +324,17 @@ internal sealed class TriffSkillsController : IDisposable
             _ => $"{response.Method} {response.Path} returned {(int)response.StatusCode}: {response.Error}",
         };
         _state.ApplyFetchFailure(characterId, message, definitive);
+        PersistRefreshFailure(characterId);
         PostError("refresh-characters", $"{character.CharacterName}: {message}");
         return false;
     }
 
-    private async Task<string> AccessTokenForAsync(
-        long characterId,
-        bool forceRefresh,
-        string? rejectedAccessToken,
-        CancellationToken cancellationToken)
+    private void PersistRefreshFailure(long characterId)
     {
-        var now = _time.GetUtcNow();
-        if (_accessTokens.TryGetValue(characterId, out var cached)
-            && cached.ExpiresUtc > now.AddSeconds(30)
-            && (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal)))
+        var error = _saveState();
+        if (error is not null)
         {
-            return cached.AccessToken;
-        }
-
-        var gate = CharacterLock(characterId);
-        await gate.WaitAsync(cancellationToken);
-        try
-        {
-            now = _time.GetUtcNow();
-            if (_accessTokens.TryGetValue(characterId, out cached)
-                && cached.ExpiresUtc > now.AddSeconds(30)
-                && (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal)))
-            {
-                return cached.AccessToken;
-            }
-            if (forceRefresh) _accessTokens.TryRemove(characterId, out _);
-
-            var character = _state.Find(characterId) ?? throw new OperationCanceledException("Character was forgotten.");
-            var target = CredentialTarget(characterId);
-            var previousRefresh = _credentials.Read(target);
-            if (string.IsNullOrWhiteSpace(previousRefresh))
-            {
-                throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "No TriffSkills refresh token is stored for this character.");
-            }
-
-            var token = await _sso.RefreshAsync(previousRefresh, cancellationToken);
-            if (token.Identity.CharacterId != characterId)
-            {
-                throw new OAuthTokenException(HttpStatusCode.Unauthorized, "identity_mismatch", "Refreshed token belongs to a different character.");
-            }
-            if (!string.IsNullOrWhiteSpace(character.OwnerHash)
-                && !string.Equals(character.OwnerHash, token.Identity.OwnerHash, StringComparison.Ordinal))
-            {
-                throw new OAuthTokenException(HttpStatusCode.Unauthorized, "owner_changed", "Character ownership changed.");
-            }
-
-            var replacement = string.IsNullOrWhiteSpace(token.RefreshToken) ? previousRefresh : token.RefreshToken;
-            if (!string.Equals(replacement, previousRefresh, StringComparison.Ordinal))
-            {
-                try
-                {
-                    _credentials.Write(target, replacement);
-                }
-                catch
-                {
-                    try { _credentials.Write(target, previousRefresh); } catch { /* surfaced by the original write failure */ }
-                    throw;
-                }
-            }
-
-            var previousCharacter = character.Clone();
-            character.CharacterName = token.Identity.CharacterName;
-            character.OwnerHash = token.Identity.OwnerHash;
-            character.Scopes = token.Identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
-            if (!_state.TrySave(out var stateError))
-            {
-                character.CharacterName = previousCharacter.CharacterName;
-                character.OwnerHash = previousCharacter.OwnerHash;
-                character.Scopes = previousCharacter.Scopes;
-                throw new IOException($"Authorization metadata could not be saved; the validated rotated credential was retained: {stateError}");
-            }
-            _accessTokens[characterId] = Cache(token);
-            return token.AccessToken;
-        }
-        finally
-        {
-            gate.Release();
+            PostError("refresh-characters", $"Character {characterId}: refresh failure state could not be saved: {error}");
         }
     }
 
@@ -575,7 +380,6 @@ internal sealed class TriffSkillsController : IDisposable
         }
         catch (OperationCanceledException) when (_lifetime.IsCancellationRequested)
         {
-            // App is closing.
         }
         catch (Exception exception)
         {
@@ -674,47 +478,21 @@ internal sealed class TriffSkillsController : IDisposable
     {
         var requestId = ReadRequestId(message);
         if (requestId.Length == 0) return;
+        var revision = ReadRevision(message);
         var name = ReadString(message, "name", PlanNameValidator.MaxNameLength + 8);
         var contents = ReadRawString(message, "contents");
-        if (contents.Length > SkillPlanParser.MaxContentCharacters)
-        {
-            PostPlanPreview(requestId, null, [new PlanDiagnostic(0, $"Plan exceeds {SkillPlanParser.MaxContentCharacters:N0} characters.")]);
-            return;
-        }
-        if (Encoding.UTF8.GetByteCount(contents) > MaxBridgePayloadBytes)
-        {
-            PostPlanPreview(requestId, null, [new PlanDiagnostic(0, "Plan payload exceeds the bridge-size limit.")]);
-            return;
-        }
-        if (!PlanNameValidator.TryValidate(name, out var normalizedName, out var nameError))
-        {
-            PostPlanPreview(requestId, null, [new PlanDiagnostic(0, nameError)]);
-            return;
-        }
-
-        var parsed = SkillPlanParser.Parse(normalizedName, contents);
-        if (!parsed.IsValid || parsed.Plan is null)
-        {
-            PostPlanPreview(requestId, null, parsed.Diagnostics);
-            return;
-        }
-
         try
         {
-            var failures = await ResolveAndValidateNamesAsync(parsed.Plan.Requirements.Select(requirement => requirement.SkillName), _lifetime.Token);
-            if (failures.Count > 0)
-            {
-                PostPlanPreview(requestId, null, failures.Select(pair => new PlanDiagnostic(0, $"{pair.Key}: {pair.Value}")).ToArray());
-                return;
-            }
-
-            PrunePreviews();
-            _pendingPreviews[requestId] = new PendingPlanPreview(normalizedName, contents, parsed.Plan, _time.GetUtcNow().Add(PreviewLifetime));
-            PostPlanPreview(requestId, parsed.Plan, []);
+            var result = await _planImports.PreviewAsync(requestId, revision, name, contents, _lifetime.Token);
+            PostPlanPreview(result);
         }
         catch (Exception exception)
         {
-            PostPlanPreview(requestId, null, [new PlanDiagnostic(0, $"Could not validate skill names: {exception.Message}")]);
+            PostPlanPreview(new PlanPreviewResult(
+                requestId,
+                revision,
+                null,
+                [new PlanDiagnostic(0, $"Could not validate skill names: {exception.Message}")]));
         }
     }
 
@@ -722,41 +500,29 @@ internal sealed class TriffSkillsController : IDisposable
     {
         var requestId = ReadRequestId(message);
         if (requestId.Length == 0) return;
-        PrunePreviews();
-        if (!_pendingPreviews.TryGetValue(requestId, out var preview))
-        {
-            PostRequestError("plan-commit", requestId, "Validated preview expired or was already used. Preview the plan again.");
-            return;
-        }
-
-        var result = PlanStore.CommitValidated(
-            TriffSkillsPaths.PlansDir,
-            preview.Name,
-            preview.Contents,
-            preview.Plan,
-            ReadBool(message, "replace"));
+        var revision = ReadRevision(message);
+        var result = _planImports.Commit(requestId, revision, ReadBool(message, "replace"));
         if (result.Collision)
         {
-            _post(new { type = "triffskills:plan-commit", requestId, ok = false, collision = true, name = result.Name });
+            _post(new { type = "triffskills:plan-commit", requestId, revision, ok = false, collision = true, expired = false, name = result.Name });
             return;
         }
         if (!result.Success)
         {
-            PostRequestError("plan-commit", requestId, result.Error);
+            PostRequestError("plan-commit", requestId, revision, result.Error, result.Expired);
             return;
         }
 
         LoadPlans();
         var loaded = _plans.FirstOrDefault(plan => string.Equals(plan.Name, result.Name, StringComparison.OrdinalIgnoreCase));
-        if (loaded is null || !loaded.Requirements.SequenceEqual(preview.Plan.Requirements))
+        if (loaded is null)
         {
-            PostRequestError("plan-commit", requestId, "Plan was written but the plans folder did not reload it successfully.");
+            PostRequestError("plan-commit", requestId, revision, "Plan was saved but the plans folder could not reload it.", expired: false);
             return;
         }
 
-        _pendingPreviews.TryRemove(requestId, out _);
         PostState(force: true);
-        _post(new { type = "triffskills:plan-commit", requestId, ok = true, collision = false, name = result.Name });
+        _post(new { type = "triffskills:plan-commit", requestId, revision, ok = true, collision = false, expired = false, name = result.Name });
         await ResolvePlanNamesAsync();
     }
 
@@ -811,33 +577,6 @@ internal sealed class TriffSkillsController : IDisposable
         }
     }
 
-    private void RecoverOwnCredentials()
-    {
-        try
-        {
-            var recovered = 0;
-            foreach (var target in _credentials.EnumerateTargets(CredentialPrefix))
-            {
-                var suffix = target[CredentialPrefix.Length..];
-                if (!long.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out var characterId) || characterId <= 0) continue;
-                if (_state.Find(characterId) is not null) continue;
-                var character = _state.Upsert(characterId);
-                character.CharacterName = $"Recovered character {characterId}";
-                character.Error = "Recovered a TriffSkills credential whose state row was missing. Refresh it or forget it.";
-                recovered++;
-            }
-            if (recovered > 0)
-            {
-                _warnings.Add($"Recovered {recovered} TriffSkills credential(s) that had no visible state row.");
-                if (!_state.TrySave(out var error)) _warnings.Add($"Recovered credential rows could not be saved: {error}");
-            }
-        }
-        catch (Exception exception)
-        {
-            _warnings.Add($"Could not inspect the TriffSkills credential namespace for recovery: {exception.Message}");
-        }
-    }
-
     private void PostState(bool force = false)
     {
         var matrix = TriffSkillsMatrix.BuildCompact(_state.Characters, _plans, _skillIds.TypeIds());
@@ -847,7 +586,6 @@ internal sealed class TriffSkillsController : IDisposable
             authConfigured = !string.IsNullOrWhiteSpace(ClientId),
             authInProgress = _authInProgress,
             refreshInFlight = _refreshGate.CurrentCount == 0,
-            clientIdOverrideAllowed = ClientIdOverrideAllowed,
             characters = _state.Characters.Select(character => new
             {
                 character.CharacterId,
@@ -901,40 +639,29 @@ internal sealed class TriffSkillsController : IDisposable
         });
     }
 
-    private void PostPlanPreview(string requestId, SkillPlan? plan, IReadOnlyList<PlanDiagnostic> diagnostics)
+    private void PostPlanPreview(PlanPreviewResult result)
     {
         _post(new
         {
             type = "triffskills:plan-preview",
-            requestId,
-            ok = plan is not null && diagnostics.Count == 0,
-            name = plan?.Name ?? string.Empty,
-            requirementCount = plan?.Requirements.Count ?? 0,
-            requirements = plan?.Requirements.Take(50).ToArray() ?? [],
-            diagnostics = diagnostics.Take(100).ToArray(),
+            result.RequestId,
+            result.Revision,
+            ok = result.Plan is not null && result.Diagnostics.Count == 0,
+            name = result.Plan?.Name ?? string.Empty,
+            requirementCount = result.Plan?.Requirements.Count ?? 0,
+            requirements = result.Plan?.Requirements.Take(50).ToArray() ?? [],
+            diagnostics = result.Diagnostics.Take(100).ToArray(),
         });
     }
 
     private void PostRequestError(string action, string requestId, string message)
         => _post(new { type = $"triffskills:{action}", requestId, ok = false, collision = false, message });
 
+    private void PostRequestError(string action, string requestId, long revision, string message, bool expired)
+        => _post(new { type = $"triffskills:{action}", requestId, revision, ok = false, collision = false, expired, message });
+
     private void PostError(string action, string message)
         => _post(new { type = "triffskills:error", action, message });
-
-    private void PrunePreviews()
-    {
-        var now = _time.GetUtcNow();
-        foreach (var key in _pendingPreviews.Where(pair => pair.Value.ExpiresUtc <= now).Select(pair => pair.Key).ToArray())
-        {
-            _pendingPreviews.TryRemove(key, out _);
-        }
-        while (_pendingPreviews.Count >= 5) _pendingPreviews.TryRemove(_pendingPreviews.First().Key, out _);
-    }
-
-    private SemaphoreSlim CharacterLock(long characterId) => _characterLocks.GetOrAdd(characterId, _ => new SemaphoreSlim(1, 1));
-    private static string CredentialTarget(long characterId) => CredentialPrefix + characterId.ToString(CultureInfo.InvariantCulture);
-    private AccessTokenCache Cache(EveValidatedToken token)
-        => new(token.AccessToken, _time.GetUtcNow().AddSeconds(Math.Max(30, token.ExpiresIn - 60)));
 
     private static long ReadLong(JsonObject? message, string key)
     {
@@ -958,6 +685,11 @@ internal sealed class TriffSkillsController : IDisposable
     private static bool ReadBool(JsonObject? message, string key)
         => message?[key] is JsonValue value && value.TryGetValue<bool>(out var result) && result;
 
+    private static long ReadRevision(JsonObject? message)
+        => message?["revision"] is JsonValue value && value.TryGetValue<long>(out var revision) && revision >= 0
+            ? revision
+            : -1;
+
     private static string ReadRequestId(JsonObject? message)
     {
         var value = ReadString(message, "requestId", 65);
@@ -966,6 +698,4 @@ internal sealed class TriffSkillsController : IDisposable
             : string.Empty;
     }
 
-    private sealed record AccessTokenCache(string AccessToken, DateTimeOffset ExpiresUtc);
-    private sealed record PendingPlanPreview(string Name, string Contents, SkillPlan Plan, DateTimeOffset ExpiresUtc);
 }

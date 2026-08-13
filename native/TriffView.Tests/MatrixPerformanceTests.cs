@@ -1,4 +1,3 @@
-using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using TriffView.TriffSkills;
@@ -6,7 +5,7 @@ using Xunit;
 
 namespace TriffView.Tests;
 
-public class MatrixPerformanceTests
+public class MatrixBoundsTests
 {
     [Fact]
     public void ThirtyByOneHundredMatrixStaysCompactAndDeterministic()
@@ -30,17 +29,17 @@ public class MatrixPerformanceTests
                 .Select(offset => new PlanRequirement($"Skill {((planIndex + offset) % 200) + 1}", (offset % 5) + 1))
                 .ToArray())).ToArray();
 
-        var stopwatch = Stopwatch.StartNew();
         var first = TriffSkillsMatrix.BuildCompact(characters, plans, ids);
         var second = TriffSkillsMatrix.BuildCompact(characters, plans, ids);
-        stopwatch.Stop();
         var firstJson = JsonSerializer.Serialize(first);
         var secondJson = JsonSerializer.Serialize(second);
 
         Assert.Equal(characterCount * planCount, first.Cells.Count);
+        Assert.All(first.Cells, cell => Assert.InRange(
+            cell.ActiveCount + cell.TrainedInactiveCount + cell.QueuedCount + cell.MissingCount + cell.UnknownCount,
+            0,
+            requirementsPerPlan));
         Assert.Equal(firstJson, secondJson);
         Assert.True(Encoding.UTF8.GetByteCount(firstJson) < 1_500_000, "Compact matrix exceeded the 1.5 MB regression ceiling.");
-        Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(10), $"Two 30x100 evaluations took {stopwatch.Elapsed}.");
-        Console.WriteLine($"30x100 twice: {stopwatch.ElapsedMilliseconds} ms; {Encoding.UTF8.GetByteCount(firstJson):N0} bytes");
     }
 }

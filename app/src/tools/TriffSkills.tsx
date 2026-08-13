@@ -64,6 +64,7 @@ type CellDetail = {
 
 type Preview = {
   requestId: string;
+  revision: number;
   ok: boolean;
   name: string;
   requirementCount: number;
@@ -137,9 +138,12 @@ export default function TriffSkills() {
   const [planName, setPlanName] = useState("");
   const [planText, setPlanText] = useState("");
   const [previewRequest, setPreviewRequest] = useState("");
+  const [commitRequest, setCommitRequest] = useState("");
   const [preview, setPreview] = useState<Preview | null>(null);
   const detailRequestRef = useRef("");
-  const previewRequestRef = useRef("");
+  const inputRevisionRef = useRef(0);
+  const previewRequestRef = useRef<{ requestId: string; revision: number } | null>(null);
+  const commitRequestRef = useRef("");
   const previewRef = useRef<Preview | null>(null);
 
   useEffect(() => {
@@ -163,14 +167,25 @@ export default function TriffSkills() {
         else setError(message.message || "Could not load cell detail.");
         return;
       }
-      if (message?.type === "triffskills:plan-preview" && message.requestId === previewRequestRef.current) {
-        previewRequestRef.current = "";
+      const pendingPreview = previewRequestRef.current;
+      if (message?.type === "triffskills:plan-preview"
+        && pendingPreview
+        && message.requestId === pendingPreview.requestId
+        && message.revision === pendingPreview.revision
+        && message.revision === inputRevisionRef.current) {
+        previewRequestRef.current = null;
         setPreviewRequest("");
         previewRef.current = message as Preview;
         setPreview(previewRef.current);
         return;
       }
-      if (message?.type === "triffskills:plan-commit" && message.requestId === previewRef.current?.requestId) {
+      if (message?.type === "triffskills:plan-commit"
+        && message.requestId === commitRequestRef.current
+        && message.requestId === previewRef.current?.requestId
+        && message.revision === previewRef.current?.revision
+        && message.revision === inputRevisionRef.current) {
+        commitRequestRef.current = "";
+        setCommitRequest("");
         if (message.ok) {
           setPlanName("");
           setPlanText("");
@@ -232,23 +247,41 @@ export default function TriffSkills() {
     previewRef.current = null;
     setPreview(null);
     const id = requestId();
-    previewRequestRef.current = id;
+    const revision = inputRevisionRef.current;
+    previewRequestRef.current = { requestId: id, revision };
     setPreviewRequest(id);
-    if (!send("triffskills:preview-plan", { requestId: id, name: planName, contents: planText })) {
-      previewRequestRef.current = "";
+    if (!send("triffskills:preview-plan", { requestId: id, revision, name: planName, contents: planText })) {
+      previewRequestRef.current = null;
       setPreviewRequest("");
       setError("The native TriffView bridge is unavailable.");
     }
   }
 
   function commitPlan(replace: boolean) {
-    if (!preview?.ok) return;
-    send("triffskills:commit-plan", { requestId: preview.requestId, replace });
+    const current = previewRef.current;
+    if (!current?.ok || current.revision !== inputRevisionRef.current || commitRequestRef.current) return;
+    commitRequestRef.current = current.requestId;
+    setCommitRequest(current.requestId);
+    if (!send("triffskills:commit-plan", { requestId: current.requestId, revision: current.revision, replace })) {
+      commitRequestRef.current = "";
+      setCommitRequest("");
+      setError("The native TriffView bridge is unavailable.");
+    }
+  }
+
+  function invalidatePlanPreview() {
+    inputRevisionRef.current += 1;
+    previewRequestRef.current = null;
+    commitRequestRef.current = "";
+    previewRef.current = null;
+    setPreviewRequest("");
+    setCommitRequest("");
+    setPreview(null);
   }
 
   return (
     <section className="triffview-section triffskills">
-      <div className="triffview-section-content">
+      <div className="triffview-section-content" data-hud-scroll>
         <header className="triffview-section-header triffskills-header">
           <div>
             <h2>Skill Planner</h2>
@@ -350,24 +383,26 @@ export default function TriffSkills() {
           </main>
 
           <aside className="triffskills-sidebar">
-            <section className="triffskills-panel">
+            <section className="triffskills-panel triffskills-characters">
               <h3>Characters</h3>
-              {!state.characters.length ? <p>No authenticated characters.</p> : null}
-              {state.characters.map((character) => (
-                <article className="triffskills-character" key={character.characterId}>
-                  <div><strong>{character.characterName}</strong><small>{formatDate(character.fetchedUtc) || "Never fetched"}</small></div>
-                  {character.error ? <p className="is-error">{character.error}</p> : null}
-                  <div>
-                    {character.needsReauth ? <button type="button" onClick={() => send("triffskills:auth")}>Re-authenticate</button> : null}
-                    <button type="button" className="danger-action" onClick={() => {
-                      if (window.confirm(`Forget ${character.characterName} and delete its stored TriffSkills token?`)) {
-                        send("triffskills:forget-character", { characterId: character.characterId });
-                        if (selected?.characterId === character.characterId) setSelected(null);
-                      }
-                    }}>Forget</button>
-                  </div>
-                </article>
-              ))}
+              <div className="triffskills-character-list" data-hud-scroll>
+                {!state.characters.length ? <p>No authenticated characters.</p> : null}
+                {state.characters.map((character) => (
+                  <article className="triffskills-character" key={character.characterId}>
+                    <div><strong>{character.characterName}</strong><small>{formatDate(character.fetchedUtc) || "Never fetched"}</small></div>
+                    {character.error ? <p className="is-error">{character.error}</p> : null}
+                    <div>
+                      {character.needsReauth ? <button type="button" onClick={() => send("triffskills:auth")}>Re-authenticate</button> : null}
+                      <button type="button" className="danger-action" onClick={() => {
+                        if (window.confirm(`Forget ${character.characterName} and delete its stored TriffSkills token?`)) {
+                          send("triffskills:forget-character", { characterId: character.characterId });
+                          if (selected?.characterId === character.characterId) setSelected(null);
+                        }
+                      }}>Forget</button>
+                    </div>
+                  </article>
+                ))}
+              </div>
             </section>
 
             <section className="triffskills-panel triffskills-detail" aria-live="polite">
@@ -398,8 +433,8 @@ export default function TriffSkills() {
             <section className="triffskills-panel triffskills-import">
               <h3>Import local plan</h3>
               <p>Paste one skill per line, followed by level I–V or 1–5. Native validation runs before anything is saved.</p>
-              <label><span>Plan name</span><input maxLength={128} value={planName} onChange={(event) => { setPlanName(event.target.value); previewRef.current = null; setPreview(null); }} /></label>
-              <label><span>Plan text</span><textarea rows={8} maxLength={524288} value={planText} onChange={(event) => { setPlanText(event.target.value); previewRef.current = null; setPreview(null); }} /></label>
+              <label><span>Plan name</span><input maxLength={128} value={planName} onChange={(event) => { setPlanName(event.target.value); invalidatePlanPreview(); }} /></label>
+              <label><span>Plan text</span><textarea rows={8} maxLength={524288} value={planText} onChange={(event) => { setPlanText(event.target.value); invalidatePlanPreview(); }} /></label>
               <button type="button" disabled={Boolean(previewRequest) || !planName || !planText} onClick={previewPlan}>
                 {previewRequest ? "Validating…" : "Preview import"}
               </button>
@@ -411,8 +446,8 @@ export default function TriffSkills() {
                       <ul>{preview.requirements.map((requirement) => <li key={requirement.skillName}>{requirement.skillName} {LEVELS[requirement.level] || requirement.level}</li>)}</ul>
                       {preview.requirementCount > preview.requirements.length ? <small>First {preview.requirements.length} shown.</small> : null}
                       {preview.collision ? <p>A plan with this name exists. Replacing it overwrites that local file.</p> : null}
-                      <button type="button" className={preview.collision ? "danger-action" : "primary-action"} onClick={() => commitPlan(Boolean(preview.collision))}>
-                        {preview.collision ? "Replace local plan" : "Import local plan"}
+                      <button type="button" disabled={Boolean(commitRequest) || preview.revision !== inputRevisionRef.current} className={preview.collision ? "danger-action" : "primary-action"} onClick={() => commitPlan(Boolean(preview.collision))}>
+                        {commitRequest ? "Saving…" : preview.collision ? "Replace local plan" : "Import local plan"}
                       </button>
                     </>
                   ) : (

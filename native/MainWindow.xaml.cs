@@ -137,6 +137,8 @@ public partial class MainWindow : Window
     private EveSettingsController? _eveSettings;
     private TriffFleetsController? _triffFleets;
     private TriffSkills.TriffSkillsController? _triffSkills;
+    private WebViewTrustPolicy? _webViewTrust;
+    private bool _allowMissingPageNavigation;
     private InputOverlayWindow? _inputOverlay;
     private GuiThemePalette _guiTheme = GuiThemePalette.TriffTools;
     private TriffViewUpdateSnapshot _updateSnapshot;
@@ -393,13 +395,16 @@ public partial class MainWindow : Window
         );
         await AppWebView.EnsureCoreWebView2Async(webViewEnvironment);
 
+        var devUrl = GetDevUrl();
+        _webViewTrust = new WebViewTrustPolicy(VirtualHostName, devUrl);
         AppWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         AppWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
         AppWebView.CoreWebView2.ScriptDialogOpening += OnScriptDialogOpening;
         AppWebView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+        AppWebView.CoreWebView2.NavigationStarting += OnNavigationStarting;
+        AppWebView.CoreWebView2.NewWindowRequested += OnNewWindowRequested;
         AppWebView.CoreWebView2.NavigationCompleted += (_, _) => PostAppSettings();
 
-        var devUrl = GetDevUrl();
         if (!string.IsNullOrWhiteSpace(devUrl))
         {
             AppWebView.Source = new Uri(devUrl);
@@ -409,6 +414,7 @@ public partial class MainWindow : Window
         var distFolder = FindOverlayDistFolder();
         if (distFolder == null)
         {
+            _allowMissingPageNavigation = true;
             AppWebView.NavigateToString(MissingOverlayHtml());
             return;
         }
@@ -416,9 +422,32 @@ public partial class MainWindow : Window
         AppWebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
             VirtualHostName,
             distFolder,
-            CoreWebView2HostResourceAccessKind.Allow
+            CoreWebView2HostResourceAccessKind.Deny
         );
         AppWebView.Source = new Uri($"https://{VirtualHostName}/index.html");
+    }
+
+    private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+    {
+        if (_allowMissingPageNavigation && string.Equals(e.Uri, "about:blank", StringComparison.OrdinalIgnoreCase))
+        {
+            _allowMissingPageNavigation = false;
+            return;
+        }
+
+        var decision = _webViewTrust?.ClassifyNavigation(e.Uri) ?? WebViewNavigationKind.Rejected;
+        if (decision == WebViewNavigationKind.Internal) return;
+        e.Cancel = true;
+        if (decision == WebViewNavigationKind.External && e.IsUserInitiated) OpenExternal(e.Uri);
+    }
+
+    private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        e.Handled = true;
+        if (e.IsUserInitiated && _webViewTrust?.ClassifyNavigation(e.Uri) == WebViewNavigationKind.External)
+        {
+            OpenExternal(e.Uri);
+        }
     }
 
     private void OnScriptDialogOpening(object? sender, CoreWebView2ScriptDialogOpeningEventArgs e)
@@ -449,11 +478,15 @@ public partial class MainWindow : Window
 
     private string? GetDevUrl()
     {
+#if DEBUG
         var envUrl = Environment.GetEnvironmentVariable("TRIFFVIEW_DEV_URL");
         if (!string.IsNullOrWhiteSpace(envUrl)) return envUrl;
         return _args.Any(arg => string.Equals(arg, "--dev", StringComparison.OrdinalIgnoreCase))
             ? "http://localhost:5178"
             : null;
+#else
+        return null;
+#endif
     }
 
     private static string? FindOverlayDistFolder()
@@ -608,6 +641,7 @@ public partial class MainWindow : Window
 
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
+        if (_webViewTrust?.IsBridgeSource(e.Source) != true) return;
         JsonObject? message;
         try
         {
@@ -639,29 +673,11 @@ public partial class MainWindow : Window
             return;
         }
 
-        // Constructed on first use rather than at startup, so users who never open
-        // Skill Planner pay no startup or disk cost for it.
         if (type.StartsWith("triffskills:", StringComparison.Ordinal))
         {
-            // This is the one controller built lazily inside the event handler, so a
-            // throw here escapes into WebView2's callback and takes the app down.
-            // Report it and fall through instead.
-            try
+            _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
+            if (_triffSkills.HandleWebMessage(type, message))
             {
-                _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
-                if (_triffSkills.HandleWebMessage(type, message))
-                {
-                    return;
-                }
-            }
-            catch (Exception ex)
-            {
-                PostAppEvent(new
-                {
-                    type = "triffskills:error",
-                    action = "handle",
-                    message = $"TriffSkills failed to handle {type}: {ex.Message}",
-                });
                 return;
             }
         }
@@ -854,6 +870,7 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(url)) return;
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return;
         if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return;
+        if (!string.IsNullOrEmpty(uri.UserInfo)) return;
 
         Process.Start(new ProcessStartInfo(uri.AbsoluteUri)
         {

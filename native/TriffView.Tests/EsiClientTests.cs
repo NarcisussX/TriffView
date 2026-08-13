@@ -11,12 +11,25 @@ public class EsiClientTests
 {
     [Theory]
     [InlineData("https://evil.invalid/v1/path/")]
-    [InlineData("/latest/path/")]
     [InlineData("/v1/../secret")]
+    [InlineData("/v1/%2e%2e/secret")]
+    [InlineData("//evil.invalid/v1/path/")]
+    [InlineData("/v1/path/?override=1")]
     [InlineData("\\v1\\path")]
-    public void RejectsAnythingExceptVersionedRelativeRoutes(string path)
+    public void RejectsUnsafeRoutes(string path)
     {
         Assert.Throws<ArgumentException>(() => EsiClient.ValidateAndBuildUri(path));
+    }
+
+    [Theory]
+    [InlineData("/v4/characters/42/skills/")]
+    [InlineData("/characters/42/skills/")]
+    [InlineData("/universe/ids/")]
+    public void AcceptsVersionedAndUnversionedRelativeRoutes(string path)
+    {
+        var uri = EsiClient.ValidateAndBuildUri(path);
+        Assert.Equal("esi.evetech.net", uri.Host);
+        Assert.Equal(path, uri.AbsolutePath);
     }
 
     [Fact]
@@ -56,6 +69,20 @@ public class EsiClientTests
         Assert.True(result.Error.Length <= 2_048);
         Assert.DoesNotContain('\u0001', result.Error);
         Assert.Null(result.Value);
+    }
+
+    [Fact]
+    public async Task ErrorBodiesCannotEchoAccessTokensOrArbitraryText()
+    {
+        const string token = "access-token-value";
+        var echoed = new QueueHandler(Response(HttpStatusCode.BadRequest, $"{{\"error\":\"rejected {token}\"}}"));
+        var echoedResult = await Client(echoed).SendAsync<object>(HttpMethod.Get, "/v1/test/", token);
+        Assert.DoesNotContain(token, echoedResult.Error, StringComparison.Ordinal);
+        Assert.Contains("[redacted]", echoedResult.Error, StringComparison.Ordinal);
+
+        var arbitrary = new QueueHandler(Response(HttpStatusCode.BadRequest, "untrusted response text"));
+        var arbitraryResult = await Client(arbitrary).SendAsync<object>(HttpMethod.Get, "/v1/test/", token);
+        Assert.Equal("Remote service returned an unreadable error.", arbitraryResult.Error);
     }
 
     [Fact]

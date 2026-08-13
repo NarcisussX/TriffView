@@ -17,8 +17,6 @@
     <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
   </PropertyGroup>
 
-  <!-- The test project lives under this project's directory, so the default
-       globs would otherwise compile its sources (and its nested obj/) into the app. -->
   <ItemGroup>
     <Compile Remove="TriffView.Tests\**" />
     <None Remove="TriffView.Tests\**" />

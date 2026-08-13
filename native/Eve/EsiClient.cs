@@ -51,12 +51,12 @@ internal sealed class EsiClient
 
     public async Task<EsiResponse<T>> SendAsync<T>(
         HttpMethod method,
-        string versionedPath,
+        string path,
         string? accessToken,
         object? body = null,
         CancellationToken cancellationToken = default)
     {
-        var uri = ValidateAndBuildUri(versionedPath);
+        var uri = ValidateAndBuildUri(path);
         var bodyJson = body == null ? null : JsonSerializer.Serialize(body, _json);
         Exception? lastNetworkError = null;
 
@@ -84,13 +84,13 @@ internal sealed class EsiClient
                     response.IsSuccessStatusCode ? MaxSuccessBodyBytes : MaxErrorBodyBytes,
                     rejectOversize: response.IsSuccessStatusCode,
                     cancellationToken);
-                var error = response.IsSuccessStatusCode ? string.Empty : ReadError(text);
+                var error = response.IsSuccessStatusCode ? string.Empty : ReadError(text, accessToken);
                 if (!response.IsSuccessStatusCode)
                 {
                     error = AppendRateLimit(error, response);
                 }
 
-                if (!response.IsSuccessStatusCode && ShouldRetry(method, versionedPath, response.StatusCode, attempt))
+                if (!response.IsSuccessStatusCode && ShouldRetry(method, path, response.StatusCode, attempt))
                 {
                     await _delay(RetryDelay(response, attempt), cancellationToken);
                     continue;
@@ -103,7 +103,7 @@ internal sealed class EsiClient
                         ?? throw new InvalidDataException("ESI returned an empty JSON value.");
                 }
 
-                return new EsiResponse<T>(response.StatusCode, value, error, method.Method, versionedPath);
+                return new EsiResponse<T>(response.StatusCode, value, error, method.Method, path);
             }
             catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
@@ -125,35 +125,56 @@ internal sealed class EsiClient
             default,
             Sanitize(lastNetworkError?.Message ?? "ESI request failed after bounded retries."),
             method.Method,
-            versionedPath);
+            path);
     }
 
     internal static Uri ValidateAndBuildUri(string path)
     {
         if (string.IsNullOrWhiteSpace(path)
-            || !path.StartsWith("/v", StringComparison.Ordinal)
-            || Uri.TryCreate(path, UriKind.Absolute, out _)
-            || path.Contains("\\", StringComparison.Ordinal)
-            || path.Contains("..", StringComparison.Ordinal))
+            || path[0] != '/'
+            || path.Length < 2
+            || path[1] == '/'
+            || path.Contains('\\')
+            || path.Contains('?')
+            || path.Contains('#')
+            || path.Contains('\0')
+            || Uri.TryCreate(path, UriKind.Absolute, out _))
         {
-            throw new ArgumentException("ESI requests must use an internally constructed, versioned relative path.", nameof(path));
+            throw new ArgumentException("ESI requests must use an internally constructed relative path.", nameof(path));
         }
 
-        return new Uri(BaseUri, path.TrimStart('/'));
+        var route = path.Trim('/');
+        var segments = route.Split('/');
+        if (segments.Length == 0
+            || segments.Any(segment => segment.Length == 0
+                || segment is "." or ".."
+                || segment.Any(character => !(char.IsAsciiLetterOrDigit(character) || character is '-' or '_'))))
+        {
+            throw new ArgumentException("ESI requests must use an internally constructed relative path.", nameof(path));
+        }
+
+        var uri = new Uri(BaseUri, route + (path.EndsWith('/') ? "/" : string.Empty));
+        if (uri.Scheme != Uri.UriSchemeHttps || !string.Equals(uri.Host, BaseUri.Host, StringComparison.OrdinalIgnoreCase))
+        {
+            throw new ArgumentException("ESI requests must use the trusted ESI host.", nameof(path));
+        }
+        return uri;
     }
 
-    internal static string ReadError(string text)
+    internal static string ReadError(string text, string? accessToken = null)
     {
         if (string.IsNullOrWhiteSpace(text)) return "No response body.";
         try
         {
             var node = JsonNode.Parse(text)?.AsObject();
             var remote = node?["error"]?.GetValue<string>();
-            return Sanitize(string.IsNullOrWhiteSpace(remote) ? text : remote);
+            return string.IsNullOrWhiteSpace(remote)
+                ? "Remote service returned an unreadable error."
+                : Redact(Sanitize(remote), accessToken);
         }
-        catch
+        catch (Exception exception) when (exception is JsonException or InvalidOperationException or FormatException)
         {
-            return Sanitize(text);
+            return "Remote service returned an unreadable error.";
         }
     }
 
@@ -163,7 +184,21 @@ internal sealed class EsiClient
         var code = (int)status;
         if (code is not (408 or 420 or 429 or 500 or 502 or 503 or 504)) return false;
         if (method == HttpMethod.Get || method == HttpMethod.Put || method == HttpMethod.Delete) return true;
-        return method == HttpMethod.Post && path.StartsWith("/v3/universe/ids/", StringComparison.Ordinal);
+        return method == HttpMethod.Post && IsUniverseIdsRoute(path);
+    }
+
+    private static bool IsUniverseIdsRoute(string path)
+    {
+        var segments = path.Trim('/').Split('/');
+        var start = segments.Length > 0
+            && segments[0].Length > 1
+            && segments[0][0] == 'v'
+            && segments[0][1..].All(char.IsAsciiDigit)
+            ? 1
+            : 0;
+        return segments.Length - start == 2
+            && string.Equals(segments[start], "universe", StringComparison.Ordinal)
+            && string.Equals(segments[start + 1], "ids", StringComparison.Ordinal);
     }
 
     private static TimeSpan RetryDelay(HttpResponseMessage response, int attempt)
@@ -231,6 +266,9 @@ internal sealed class EsiClient
             .Trim();
         return cleaned.Length == 0 ? "Remote service returned an unreadable error." : cleaned;
     }
+
+    private static string Redact(string value, string? secret)
+        => string.IsNullOrEmpty(secret) ? value : value.Replace(secret, "[redacted]", StringComparison.Ordinal);
 
     private static bool IsTransientNetworkFailure(Exception exception)
         => exception is HttpRequestException or TaskCanceledException or SocketException or IOException;

@@ -40,7 +40,7 @@ public class EveSsoTokenTests
         var validator = new EveJwtValidator(ClientId, Scopes, new NoKeys());
         return new EveSsoClient(
             http,
-            new EveSsoOptions(ClientId, "http://127.0.0.1:51777/test/callback/", Scopes, "TriffView.Tests/1.0", "Tests"),
+            new EveSsoOptions(ClientId, "http://127.0.0.1:51777/test/callback/", Scopes, "TriffView.Tests/1.0"),
             validator,
             new NoBrowser());
     }

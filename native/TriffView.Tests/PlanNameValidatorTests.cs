@@ -30,7 +30,7 @@ public class PlanNameValidatorTests
     [InlineData("COM1")]
     [InlineData("lpt9")]
     [InlineData("CON.txt")]
-    [InlineData("CON.txt.bak")] // reserved stem survives any extension chain
+    [InlineData("CON.txt.bak")]
     public void RejectsReservedWindowsDeviceNames(string name)
     {
         Assert.False(PlanNameValidator.TryValidate(name, out _));
@@ -39,7 +39,7 @@ public class PlanNameValidatorTests
     [Theory]
     [InlineData("Core Ship Skills")]
     [InlineData("Marauder V")]
-    [InlineData("logi.alt plans")] // an interior dot is fine when the stem is not reserved
+    [InlineData("logi.alt plans")]
     public void AcceptsOrdinaryNames(string name)
     {
         Assert.True(PlanNameValidator.TryValidate(name, out var error));
@@ -60,7 +60,6 @@ public class PlanNameValidatorTests
         Assert.True(PlanNameValidator.IsWithin(Path.Combine(root, "plan.txt"), root));
         Assert.False(PlanNameValidator.IsWithin(root, root));
         Assert.False(PlanNameValidator.IsWithin(Path.Combine(root, "..", "escape.txt"), root));
-        // A sibling whose name merely starts with the root's name is outside it.
         Assert.False(PlanNameValidator.IsWithin(root + "-sibling" + Path.DirectorySeparatorChar + "plan.txt", root));
     }
 

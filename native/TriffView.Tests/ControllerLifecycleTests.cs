@@ -64,6 +64,58 @@ public class ControllerLifecycleTests : IDisposable
     }
 
     [Fact]
+    public void ColdRefreshWritesStateOnceWhenAuthenticationMetadataIsUnchanged()
+    {
+        SaveCharacter();
+        var credentials = new MemoryCredentials((Target(), "old-refresh"));
+        var saves = 0;
+        using var controller = Controller(
+            credentials,
+            new ControlledSso { RefreshResult = ValidToken("rotated") },
+            new SkillHandler(),
+            new(),
+            () =>
+            {
+                Interlocked.Increment(ref saves);
+                return null;
+            });
+
+        controller.HandleWebMessage("triffskills:refresh-characters", null);
+
+        Assert.True(SpinWait.SpinUntil(() => Volatile.Read(ref saves) == 1, TimeSpan.FromSeconds(3)));
+        Assert.Equal(1, saves);
+    }
+
+    [Fact]
+    public void MissingOwnerOnRefreshPreservesStoredOwner()
+    {
+        SaveCharacter();
+        var credentials = new MemoryCredentials((Target(), "old-refresh"));
+        var sso = new ControlledSso { RefreshResult = ValidToken("rotated", owner: null) };
+        using var controller = Controller(credentials, sso, new SkillHandler(), new());
+
+        controller.HandleWebMessage("triffskills:refresh-characters", null);
+
+        Assert.True(SpinWait.SpinUntil(() => TriffSkillsState.Load().State.Characters.Single().FetchedUtc is not null, TimeSpan.FromSeconds(3)));
+        Assert.Equal("owner-123456", TriffSkillsState.Load().State.Characters.Single().OwnerHash);
+    }
+
+    [Fact]
+    public void OwnerMismatchRequiresReauthenticationWithoutReplacingCredential()
+    {
+        SaveCharacter();
+        var credentials = new MemoryCredentials((Target(), "old-refresh"));
+        var sso = new ControlledSso { RefreshResult = ValidToken("rotated", owner: "different-owner") };
+        using var controller = Controller(credentials, sso, new SkillHandler(), new());
+
+        controller.HandleWebMessage("triffskills:refresh-characters", null);
+
+        Assert.True(SpinWait.SpinUntil(() => TriffSkillsState.Load().State.Characters.Single().NeedsReauth, TimeSpan.FromSeconds(3)));
+        Assert.Equal("old-refresh", credentials.Read(Target()));
+        Assert.Equal("owner-123456", TriffSkillsState.Load().State.Characters.Single().OwnerHash);
+    }
+
+    [Fact]
     public void ForgetDuringRefreshCannotRecreateCharacterOrCredential()
     {
         SaveCharacter();
@@ -81,6 +133,27 @@ public class ControllerLifecycleTests : IDisposable
         Assert.True(SpinWait.SpinUntil(
             () => credentials.Read(Target()) is null && TriffSkillsState.Load().State.Characters.Count == 0,
             TimeSpan.FromSeconds(3)));
+    }
+
+    [Fact]
+    public void ForgetDuringReauthorizationCannotRecreateCharacterOrCredential()
+    {
+        SaveCharacter();
+        var credentials = new MemoryCredentials((Target(), "old-refresh"));
+        var authorization = new TaskCompletionSource<EveValidatedToken>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sso = new ControlledSso { AuthorizeTask = authorization.Task };
+        var messages = new ConcurrentQueue<string>();
+        using var controller = Controller(credentials, sso, new SkillHandler(), messages);
+
+        controller.HandleWebMessage("triffskills:auth", null);
+        Assert.True(SpinWait.SpinUntil(() => sso.AuthorizeCalls == 1, TimeSpan.FromSeconds(2)));
+        controller.HandleWebMessage("triffskills:forget-character", JsonNode.Parse("""{"characterId":42}""")!.AsObject());
+        Assert.True(SpinWait.SpinUntil(() => credentials.Read(Target()) is null, TimeSpan.FromSeconds(2)));
+        authorization.SetResult(ValidToken("reauthorized"));
+
+        Assert.True(SpinWait.SpinUntil(() => messages.Any(json => json.Contains("authentication was cancelled", StringComparison.Ordinal)), TimeSpan.FromSeconds(2)));
+        Assert.Empty(TriffSkillsState.Load().State.Characters);
+        Assert.Null(credentials.Read(Target()));
     }
 
     [Fact]
@@ -118,6 +191,20 @@ public class ControllerLifecycleTests : IDisposable
     }
 
     [Fact]
+    public void CredentialReadFailureKeepsCharacterVisible()
+    {
+        SaveCharacter();
+        var credentials = new MemoryCredentials((Target(), "old-refresh")) { FailRead = true };
+        var messages = new ConcurrentQueue<string>();
+        using var controller = Controller(credentials, new ControlledSso(), new SkillHandler(), messages);
+
+        controller.HandleWebMessage("triffskills:forget-character", JsonNode.Parse("""{"characterId":42}""")!.AsObject());
+
+        Assert.True(SpinWait.SpinUntil(() => messages.Any(json => json.Contains("Credential lookup failed", StringComparison.Ordinal)), TimeSpan.FromSeconds(2)));
+        Assert.Single(TriffSkillsState.Load().State.Characters);
+    }
+
+    [Fact]
     public void CredentialWriteFailureDoesNotCreateAuthenticatedRow()
     {
         var credentials = new MemoryCredentials { FailWrite = true };
@@ -139,6 +226,7 @@ public class ControllerLifecycleTests : IDisposable
         var message = new JsonObject
         {
             ["requestId"] = requestId,
+            ["revision"] = 1,
             ["name"] = "Bad plan",
             ["contents"] = "Bogus Module V\n",
         };
@@ -155,10 +243,11 @@ public class ControllerLifecycleTests : IDisposable
         MemoryCredentials credentials,
         ControlledSso sso,
         HttpMessageHandler handler,
-        ConcurrentQueue<string> messages)
+        ConcurrentQueue<string> messages,
+        Func<string?>? saveState = null)
     {
         var esi = new EsiClient(new HttpClient(handler), new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase }, "TriffView.Tests/1.0");
-        return new TriffSkillsController(value => messages.Enqueue(JsonSerializer.Serialize(value)), credentials, esi, sso, TimeProvider.System);
+        return new TriffSkillsController(value => messages.Enqueue(JsonSerializer.Serialize(value)), credentials, esi, sso, TimeProvider.System, saveState);
     }
 
     private void SaveCharacter()
@@ -167,16 +256,16 @@ public class ControllerLifecycleTests : IDisposable
         var character = state.Upsert(42);
         character.CharacterName = "Pilot";
         character.OwnerHash = "owner-123456";
-        character.Scopes = Scopes.ToList();
+        character.Scopes = Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
         Assert.True(state.TrySave(out var error), error);
     }
 
-    private static string Target() => TriffSkillsController.CredentialPrefix + "42";
-    private static EveValidatedToken ValidToken(string refresh) => new(
+    private static string Target() => TriffSkillsAuthentication.CredentialPrefix + "42";
+    private static EveValidatedToken ValidToken(string refresh, string? owner = "owner-123456", long characterId = 42) => new(
         "access-token",
         refresh,
         1_200,
-        new EveIdentity(42, "Pilot", "owner-123456", Scopes));
+        new EveIdentity(characterId, "Pilot", owner, Scopes));
 
     private sealed class ControlledSso : IEveSsoClient
     {
@@ -203,8 +292,13 @@ public class ControllerLifecycleTests : IDisposable
     {
         private readonly ConcurrentDictionary<string, string> _values = new(entries.ToDictionary(entry => entry.Target, entry => entry.Secret), StringComparer.Ordinal);
         public bool FailDelete { get; init; }
+        public bool FailRead { get; init; }
         public bool FailWrite { get; init; }
-        public string? Read(string target) => _values.TryGetValue(target, out var value) ? value : null;
+        public string? Read(string target)
+        {
+            if (FailRead) throw new IOException("credential read failed");
+            return _values.TryGetValue(target, out var value) ? value : null;
+        }
         public void Write(string target, string secret)
         {
             if (FailWrite) throw new IOException("credential write failed");

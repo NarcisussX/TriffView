@@ -61,6 +61,38 @@ public class PlanStoreTests : IDisposable
     }
 
     [Fact]
+    public void CommitReturnsControlledErrorWhenPlansPathIsAFile()
+    {
+        Directory.CreateDirectory(_dir);
+        var blockingPath = Path.Combine(_dir, "blocking-file");
+        File.WriteAllText(blockingPath, "not a directory");
+        var preview = SkillPlanParser.Parse("Plan", "Navigation V\n").Plan!;
+
+        var result = PlanStore.CommitValidated(blockingPath, "Plan", "Navigation V\n", preview, replace: false);
+
+        Assert.False(result.Success);
+        Assert.False(result.Collision);
+        Assert.Contains("not saved", result.Error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ReplacementReportsOriginalAndRollbackFailure()
+    {
+        Directory.CreateDirectory(_dir);
+        var path = Path.Combine(_dir, "Plan.txt");
+        File.WriteAllText(path, "Navigation V\n");
+        Directory.CreateDirectory(path + ".bak");
+        var replacement = SkillPlanParser.Parse("Plan", "Gunnery III\n").Plan!;
+
+        var result = PlanStore.CommitValidated(_dir, "Plan", "Gunnery III\n", replacement, replace: true);
+
+        Assert.False(result.Success);
+        Assert.Contains("not saved", result.Error, StringComparison.Ordinal);
+        Assert.Contains("rollback also failed", result.Error, StringComparison.Ordinal);
+        Assert.Equal("Navigation V\n", File.ReadAllText(path));
+    }
+
+    [Fact]
     public void LoadCapsPlanCountAndReportsTheLimit()
     {
         Directory.CreateDirectory(_dir);

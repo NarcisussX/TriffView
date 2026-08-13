@@ -48,6 +48,7 @@ internal sealed class TriffFleetsController : IDisposable
     private readonly ICredentialStore _credentials;
     private readonly EsiClient _esi;
     private readonly IEveSsoClient _sso;
+    private readonly Action _saveState;
     private readonly CancellationTokenSource _lifetime = new();
     private readonly SemaphoreSlim _authGate = new(1, 1);
     private readonly TriffFleetsLocalState _state;
@@ -71,14 +72,17 @@ internal sealed class TriffFleetsController : IDisposable
         Action<object> postToHud,
         ICredentialStore credentials,
         EsiClient esi,
-        IEveSsoClient sso)
+        IEveSsoClient sso,
+        TriffFleetsLocalState? state = null,
+        Action? saveState = null)
     {
         _dispatcher = dispatcher;
         _postToHud = postToHud;
         _credentials = credentials;
         _esi = esi;
         _sso = sso;
-        _state = TriffFleetsLocalState.Load();
+        _state = state ?? TriffFleetsLocalState.Load();
+        _saveState = saveState ?? _state.Save;
         _startupWarning = _state.LoadWarning;
         RecoverOwnCredentials();
     }
@@ -105,7 +109,7 @@ internal sealed class TriffFleetsController : IDisposable
             }
             if (!added) return;
             _state.SelectedBossCharacterId = _state.Bosses.First().CharacterId;
-            _state.Save();
+            _saveState();
             AppendStartupWarning("Recovered Fleet Manager credential entries whose state rows were missing. Refresh or forget those characters.");
         }
         catch (Exception exception)
@@ -121,7 +125,7 @@ internal sealed class TriffFleetsController : IDisposable
     {
         var keys = new EveSigningKeySource(Http);
         var validator = new EveJwtValidator(ClientId, RequiredScopes, keys);
-        return new EveSsoClient(Http, new EveSsoOptions(ClientId, RedirectUri, RequiredScopes, UserAgent, "TriffFleets"), validator);
+        return new EveSsoClient(Http, new EveSsoOptions(ClientId, RedirectUri, RequiredScopes, UserAgent), validator);
     }
 
     public bool HandleWebMessage(string type, JsonObject? message)
@@ -203,7 +207,7 @@ internal sealed class TriffFleetsController : IDisposable
     {
         if (characterId <= 0 || _state.Bosses.All(boss => boss.CharacterId != characterId)) return;
         _state.SelectedBossCharacterId = characterId;
-        _state.Save();
+        _saveState();
         _liveFleet = null;
         _lastPlan = null;
         _lastApply = null;
@@ -216,14 +220,12 @@ internal sealed class TriffFleetsController : IDisposable
         _authCancellation?.Cancel();
         _authCancellation?.Dispose();
         _lifetime.Dispose();
-        // Do not dispose gates that a cancellation-aware in-flight operation may
-        // still be unwinding through.
     }
 
     private async Task ForgetBossAsync(long characterId)
     {
         if (characterId <= 0) return;
-        var gate = _tokenLocks.GetOrAdd(characterId, _ => new SemaphoreSlim(1, 1));
+        var gate = TokenLock(characterId);
         await gate.WaitAsync(_lifetime.Token);
         var target = RefreshTokenTarget(characterId);
         var bossIndex = -1;
@@ -249,7 +251,7 @@ internal sealed class TriffFleetsController : IDisposable
             _liveFleet = null;
             _lastPlan = null;
             _lastApply = null;
-            _state.Save();
+            _saveState();
             PostState(force: true);
         }
         catch (Exception exception)
@@ -282,7 +284,7 @@ internal sealed class TriffFleetsController : IDisposable
         var profile = FleetProfile.Default(string.IsNullOrWhiteSpace(name) ? "New Fleet Profile" : name.Trim());
         _state.Profiles.Add(profile);
         _state.SelectedProfileId = profile.Id;
-        _state.Save();
+        _saveState();
         _lastPlan = null;
         _lastApply = null;
         PostState(force: true);
@@ -292,7 +294,7 @@ internal sealed class TriffFleetsController : IDisposable
     {
         if (string.IsNullOrWhiteSpace(profileId) || _state.Profiles.All(profile => profile.Id != profileId)) return;
         _state.SelectedProfileId = profileId;
-        _state.Save();
+        _saveState();
         _lastPlan = null;
         _lastApply = null;
         PostState(force: true);
@@ -327,7 +329,7 @@ internal sealed class TriffFleetsController : IDisposable
         if (index >= 0) _state.Profiles[index] = profile;
         else _state.Profiles.Add(profile);
         _state.SelectedProfileId = profile.Id;
-        _state.Save();
+        _saveState();
         _lastPlan = null;
         _lastApply = null;
         PostState(force: true);
@@ -348,7 +350,7 @@ internal sealed class TriffFleetsController : IDisposable
             _state.SelectedProfileId = _state.Profiles.FirstOrDefault()?.Id ?? "";
         }
 
-        _state.Save();
+        _saveState();
         _lastPlan = null;
         _lastApply = null;
         PostState(force: true);
@@ -376,7 +378,7 @@ internal sealed class TriffFleetsController : IDisposable
                 if (string.IsNullOrWhiteSpace(profile.Name)) profile.Name = Path.GetFileNameWithoutExtension(dialog.FileName);
                 _state.Profiles.Add(profile);
                 _state.SelectedProfileId = profile.Id;
-                _state.Save();
+                _saveState();
                 _lastPlan = null;
                 _lastApply = null;
                 PostState(force: true);
@@ -437,11 +439,26 @@ internal sealed class TriffFleetsController : IDisposable
         _authInProgress = true;
         _authCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         PostState(force: true);
+        var bossesAtStart = _state.Bosses.Select(boss => boss.CharacterId).ToHashSet();
         try
         {
             var token = await _sso.AuthorizeAsync(AuthTimeout, _authCancellation.Token);
-            CommitAuthentication(token);
             var identity = token.Identity;
+            var gate = TokenLock(identity.CharacterId);
+            await gate.WaitAsync(_authCancellation.Token);
+            try
+            {
+                if (bossesAtStart.Contains(identity.CharacterId)
+                    && _state.Bosses.All(boss => boss.CharacterId != identity.CharacterId))
+                {
+                    throw new OperationCanceledException("The fleet boss was forgotten while reauthorization was in progress.");
+                }
+                CommitAuthentication(token);
+            }
+            finally
+            {
+                gate.Release();
+            }
             _accessTokens[identity.CharacterId] = Cache(token);
             _liveFleet = null;
             _lastPlan = null;
@@ -483,6 +500,7 @@ internal sealed class TriffFleetsController : IDisposable
         var existing = _state.Bosses.FirstOrDefault(boss => boss.CharacterId == identity.CharacterId);
         var oldBoss = existing is null ? null : existing.Clone();
         var oldSelected = _state.SelectedBossCharacterId;
+        Exception? rollbackFailure = null;
         try
         {
             _credentials.Write(target, token.RefreshToken);
@@ -492,7 +510,7 @@ internal sealed class TriffFleetsController : IDisposable
                 {
                     CharacterId = identity.CharacterId,
                     CharacterName = identity.CharacterName,
-                    OwnerHash = identity.OwnerHash,
+                    OwnerHash = identity.OwnerHash ?? string.Empty,
                     Scopes = identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList(),
                     AuthenticatedUtc = DateTimeOffset.UtcNow,
                 });
@@ -500,21 +518,31 @@ internal sealed class TriffFleetsController : IDisposable
             else
             {
                 existing.CharacterName = identity.CharacterName;
-                existing.OwnerHash = identity.OwnerHash;
+                if (!string.IsNullOrWhiteSpace(identity.OwnerHash)) existing.OwnerHash = identity.OwnerHash;
                 existing.Scopes = identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
                 existing.AuthenticatedUtc = DateTimeOffset.UtcNow;
             }
             _state.SelectedBossCharacterId = identity.CharacterId;
-            _state.Save();
+            _saveState();
         }
-        catch
+        catch (Exception original)
         {
             if (existing is null) _state.Bosses.RemoveAll(boss => boss.CharacterId == identity.CharacterId);
             else existing.CopyFrom(oldBoss!);
             _state.SelectedBossCharacterId = oldSelected;
-            if (string.IsNullOrWhiteSpace(oldCredential)) _credentials.Delete(target);
-            else _credentials.Write(target, oldCredential);
-            throw;
+            try
+            {
+                if (string.IsNullOrWhiteSpace(oldCredential)) _credentials.Delete(target);
+                else _credentials.Write(target, oldCredential);
+            }
+            catch (Exception rollback)
+            {
+                rollbackFailure = rollback;
+            }
+            if (rollbackFailure is null) throw;
+            throw new InvalidOperationException(
+                $"Fleet authentication failed: {original.Message}; credential rollback also failed: {rollbackFailure.Message}",
+                new AggregateException(original, rollbackFailure));
         }
     }
 
@@ -526,50 +554,63 @@ internal sealed class TriffFleetsController : IDisposable
 
     private async Task<FleetAccessToken> AccessTokenForBossAsync(long characterId, bool forceRefresh, string? rejectedAccessToken)
     {
-        var boss = _state.Bosses.FirstOrDefault(item => item.CharacterId == characterId)
-            ?? throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "This fleet boss needs to authenticate again.");
-        if (_accessTokens.TryGetValue(boss.CharacterId, out var cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30))
-        {
-            if (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal))
-            {
-                return new FleetAccessToken(characterId, cached.AccessToken);
-            }
-        }
-        var gate = _tokenLocks.GetOrAdd(boss.CharacterId, _ => new SemaphoreSlim(1, 1));
+        var gate = TokenLock(characterId);
         await gate.WaitAsync(_lifetime.Token);
         try
         {
-            if (_accessTokens.TryGetValue(boss.CharacterId, out cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30)
+            var boss = _state.Bosses.FirstOrDefault(item => item.CharacterId == characterId)
+                ?? throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "This fleet boss needs to authenticate again.");
+            if (_accessTokens.TryGetValue(characterId, out var cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30)
                 && (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal)))
             {
                 return new FleetAccessToken(characterId, cached.AccessToken);
             }
-            if (forceRefresh) _accessTokens.TryRemove(boss.CharacterId, out _);
-            var oldRefresh = _credentials.Read(RefreshTokenTarget(boss.CharacterId));
+            if (forceRefresh) _accessTokens.TryRemove(characterId, out _);
+            var target = RefreshTokenTarget(characterId);
+            var oldRefresh = _credentials.Read(target);
             if (string.IsNullOrWhiteSpace(oldRefresh)) throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "This fleet boss needs to authenticate again.");
             var token = await _sso.RefreshAsync(oldRefresh, _lifetime.Token);
-            if (token.Identity.CharacterId != boss.CharacterId) throw new OAuthTokenException(HttpStatusCode.Unauthorized, "identity_mismatch", "Refreshed token belongs to a different character.");
-            if (!string.IsNullOrWhiteSpace(boss.OwnerHash) && !string.Equals(boss.OwnerHash, token.Identity.OwnerHash, StringComparison.Ordinal))
+            if (_state.Bosses.All(item => item.CharacterId != characterId)) throw new OperationCanceledException("Fleet boss was forgotten.");
+            if (token.Identity.CharacterId != characterId) throw new OAuthTokenException(HttpStatusCode.Unauthorized, "identity_mismatch", "Refreshed token belongs to a different character.");
+            if (!string.IsNullOrWhiteSpace(boss.OwnerHash)
+                && !string.IsNullOrWhiteSpace(token.Identity.OwnerHash)
+                && !string.Equals(boss.OwnerHash, token.Identity.OwnerHash, StringComparison.Ordinal))
             {
                 throw new OAuthTokenException(HttpStatusCode.Unauthorized, "owner_changed", "Character ownership changed; authenticate again.");
             }
             var rotated = string.IsNullOrWhiteSpace(token.RefreshToken) ? oldRefresh : token.RefreshToken;
-            if (!string.Equals(rotated, oldRefresh, StringComparison.Ordinal)) _credentials.Write(RefreshTokenTarget(boss.CharacterId), rotated);
+            var credentialChanged = !string.Equals(rotated, oldRefresh, StringComparison.Ordinal);
+            if (credentialChanged) _credentials.Write(target, rotated);
             var oldBoss = boss.Clone();
             boss.CharacterName = token.Identity.CharacterName;
-            boss.OwnerHash = token.Identity.OwnerHash;
+            if (!string.IsNullOrWhiteSpace(token.Identity.OwnerHash)) boss.OwnerHash = token.Identity.OwnerHash;
             boss.Scopes = token.Identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
             boss.AuthenticatedUtc = DateTimeOffset.UtcNow;
             try
             {
-                _state.Save();
+                _saveState();
             }
-            catch
+            catch (Exception original)
             {
                 boss.CopyFrom(oldBoss);
-                throw;
+                Exception? rollbackFailure = null;
+                if (credentialChanged)
+                {
+                    try
+                    {
+                        _credentials.Write(target, oldRefresh);
+                    }
+                    catch (Exception rollback)
+                    {
+                        rollbackFailure = rollback;
+                    }
+                }
+                if (rollbackFailure is null) throw;
+                throw new InvalidOperationException(
+                    $"Fleet authorization metadata could not be saved: {original.Message}; credential rollback also failed: {rollbackFailure.Message}",
+                    new AggregateException(original, rollbackFailure));
             }
-            _accessTokens[boss.CharacterId] = Cache(token);
+            _accessTokens[characterId] = Cache(token);
             return new FleetAccessToken(characterId, token.AccessToken);
         }
         finally
@@ -1059,7 +1100,7 @@ internal sealed class TriffFleetsController : IDisposable
         if (liveLayoutChanged)
         {
             liveLayout.UpdatedUtc = DateTimeOffset.UtcNow;
-            _state.Save();
+            _saveState();
         }
 
         return new FleetStructureResult(map, liveWings, mutated);
@@ -1500,7 +1541,7 @@ internal sealed class TriffFleetsController : IDisposable
                     ResolvedUtc = DateTimeOffset.UtcNow,
                 };
             }
-            _state.Save();
+            _saveState();
         }
 
         return result;
@@ -1610,6 +1651,7 @@ internal sealed class TriffFleetsController : IDisposable
     }
 
     private static string RefreshTokenTarget(long characterId) => CredentialPrefix + characterId;
+    private SemaphoreSlim TokenLock(long characterId) => _tokenLocks.GetOrAdd(characterId, _ => new SemaphoreSlim(1, 1));
 }
 
 internal sealed class TriffFleetsLocalState

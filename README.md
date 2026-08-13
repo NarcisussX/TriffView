@@ -52,8 +52,6 @@ TriffSkills uses the same EVE application registration as Fleet Manager, but its
 
 Refresh tokens are stored in Windows Credential Manager under `TriffView.TriffSkills.RefreshToken.<character-id>`. Fleet Manager tokens remain under `TriffView.TriffFleets.RefreshToken.<character-id>`. Access tokens exist only in process memory and are discarded when TriffView exits. The local JSON cache contains character identity metadata, granted scope names, active/trained skill levels, queue timing, and the last successful fetch time; it never contains access or refresh tokens. Forget deletes the TriffSkills credential and then removes that character's local row. If a refresh fails temporarily, the last-good snapshot remains visible and is labelled with the error rather than being replaced with empty data.
 
-SSO access tokens are accepted only after signature, issuer, audience, lifetime, character subject, owner, authorized-party, and required-scope validation. This reduces known trust-boundary risks; it is not a guarantee that the feature or its dependencies are free of vulnerabilities. The manual security checklist and remaining limits are in `docs/TRIFFSKILLS_SECURITY_REVIEW.md`.
-
 TriffSkills is read-only. It does not train skills, buy skill injectors, change your queue, or control EVE clients.
 
 ## TriffAlerts Included
