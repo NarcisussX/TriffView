@@ -26,7 +26,7 @@ TriffView is a standalone preview system paired with configurable log alerts, a 
 - EVE-X Preview JSON import.
 - Full TriffView settings backup export and restore.
 - Fleet Manager for saving wing/squad layouts, pre-assigning characters, restructuring live fleets, moving existing members, and sending ESI invites.
-- TriffSkills for scoring your authenticated characters against shared skill plans, with the skills each one still needs.
+- TriffSkills for scoring your authenticated characters against local skill plans, with the skills each one still needs.
 - Dark themed standalone settings window with selectable GUI themes.
 - Tray controls for quick enable, disable, suspend, save, restore, reload, and quit actions.
 
@@ -44,11 +44,15 @@ Fleet Manager does not control EVE clients. It does not inject keyboard input, m
 
 ## TriffSkills Included
 
-TriffSkills shows which skill plans your characters can already fly. Authenticate a character through EVE SSO, and TriffSkills reads its trained skills and skill queue through ESI, then scores every plan as Ready, Training, or Missing in one matrix so you can see at a glance which character to fly, and what the ones that fall short are still missing.
+TriffSkills shows which local skill plans your characters can already fly. Authenticate a character through EVE SSO, and TriffSkills reads active levels, trained levels, and the skill queue through ESI. The matrix distinguishes Ready, Training, Trained but inactive, Missing, Unknown, and Not scored. Ready means every required level is currently active; a trained but inactive alpha-restricted level is not reported as ready.
 
-Plans are plain text in the format EVE's own skill plan window copies to the clipboard: one skill per line, name then level (`Navigation V`). Use Import from clipboard to save a plan copied from the game or shared by your corp, or drop `.txt` files into the plans folder (`Open plans folder` takes you there, `Reload plans` picks up changes without restarting). One starter plan, Core Ship Skills, is written the first time TriffSkills runs so the matrix has something to score against - delete it if you do not want it and it will not come back.
+Plans are local plain-text files: one skill per line, name then level (`Navigation V`). Paste text into Import local plan, review the native validation preview, then explicitly confirm the save. Malformed non-comment lines reject the whole import instead of being silently skipped. You can also place `.txt` files in `%APPDATA%\TriffView\TriffSkills\plans`; Open plans folder takes you there and Reload plans picks up changes without restarting. One starter plan, Core Ship Skills, is written only when the plans directory is first created.
 
-TriffSkills uses the same EVE application registration as Fleet Manager, but its own consent: the login screen asks for `esi-skills.read_skills.v1` and `esi-skills.read_skillqueue.v1` and nothing else, and its sign-ins are stored separately from Fleet Manager's. If you are building TriffView against your own registration, point TriffSkills at it with the `TRIFFVIEW_TRIFFSKILLS_CLIENT_ID` environment variable.
+TriffSkills uses the same EVE application registration as Fleet Manager, but its own consent and Credential Manager namespace. Its login asks for `esi-skills.read_skills.v1` and `esi-skills.read_skillqueue.v1` and nothing else. A debug build can use `TRIFFVIEW_TRIFFSKILLS_CLIENT_ID` for development; release builds always use the registered built-in client ID.
+
+Refresh tokens are stored in Windows Credential Manager under `TriffView.TriffSkills.RefreshToken.<character-id>`. Fleet Manager tokens remain under `TriffView.TriffFleets.RefreshToken.<character-id>`. Access tokens exist only in process memory and are discarded when TriffView exits. The local JSON cache contains character identity metadata, granted scope names, active/trained skill levels, queue timing, and the last successful fetch time; it never contains access or refresh tokens. Forget deletes the TriffSkills credential and then removes that character's local row. If a refresh fails temporarily, the last-good snapshot remains visible and is labelled with the error rather than being replaced with empty data.
+
+SSO access tokens are accepted only after signature, issuer, audience, lifetime, character subject, owner, authorized-party, and required-scope validation. This reduces known trust-boundary risks; it is not a guarantee that the feature or its dependencies are free of vulnerabilities. The manual security checklist and remaining limits are in `docs/TRIFFSKILLS_SECURITY_REVIEW.md`.
 
 TriffSkills is read-only. It does not train skills, buy skill injectors, change your queue, or control EVE clients.
 

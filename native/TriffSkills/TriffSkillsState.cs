@@ -1,7 +1,6 @@
-using System.Diagnostics;
 using System.IO;
-using System.Text;
 using System.Text.Json;
+using TriffView.Eve;
 
 namespace TriffView.TriffSkills;
 
@@ -9,19 +8,13 @@ internal static class TriffSkillsPaths
 {
     private static string? _rootOverride;
 
-    // Test seam: TriffView.Tests redirects the root to a temp directory. Production
-    // code never calls this.
     public static void OverrideRoot(string root) => _rootOverride = root;
-
-    // Paired with OverrideRoot: the override is process-global, so a test class that
-    // does not clear it leaves every later reader pointed at a deleted temp directory.
     public static void ClearOverride() => _rootOverride = null;
 
     public static string Root => _rootOverride ?? Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "TriffHud",
-        "TriffSkills"
-    );
+        "TriffView",
+        "TriffSkills");
 
     public static string StatePath => Path.Combine(Root, "state.json");
     public static string SkillIdsPath => Path.Combine(Root, "skill-ids.json");
@@ -40,166 +33,164 @@ internal static class TriffSkillsJson
 internal sealed class TriffSkillsCharacter
 {
     public long CharacterId { get; set; }
-    public string CharacterName { get; set; } = "";
-    public List<string> Scopes { get; set; } = new();
+    public string CharacterName { get; set; } = string.Empty;
+    public string OwnerHash { get; set; } = string.Empty;
+    public List<string> Scopes { get; set; } = [];
     public DateTimeOffset AuthenticatedUtc { get; set; }
     public DateTimeOffset? FetchedUtc { get; set; }
-    public Dictionary<int, int> TrainedLevels { get; set; } = new();   // typeID -> level
-    public List<QueueEntry> Queue { get; set; } = new();
-    public string Error { get; set; } = "";
+    public Dictionary<int, int> ActiveLevels { get; set; } = [];
+    public Dictionary<int, int> TrainedLevels { get; set; } = [];
+    public List<QueueEntry> Queue { get; set; } = [];
+    public string Error { get; set; } = string.Empty;
     public bool NeedsReauth { get; set; }
+
+    public TriffSkillsCharacter Clone() => new()
+    {
+        CharacterId = CharacterId,
+        CharacterName = CharacterName,
+        OwnerHash = OwnerHash,
+        Scopes = [.. Scopes],
+        AuthenticatedUtc = AuthenticatedUtc,
+        FetchedUtc = FetchedUtc,
+        ActiveLevels = new Dictionary<int, int>(ActiveLevels),
+        TrainedLevels = new Dictionary<int, int>(TrainedLevels),
+        Queue = [.. Queue],
+        Error = Error,
+        NeedsReauth = NeedsReauth,
+    };
 }
+
+internal sealed record StateLoadResult(TriffSkillsState State, string Warning);
 
 internal sealed class TriffSkillsState
 {
-    public List<TriffSkillsCharacter> Characters { get; set; } = new();
+    private const long MaxStateFileBytes = 16 * 1024 * 1024;
+    public const int MaxCharacters = 50;
+    public List<TriffSkillsCharacter> Characters { get; set; } = [];
     public long SelectedCharacterId { get; set; }
 
-    public static TriffSkillsState Load()
+    public static StateLoadResult Load()
     {
+        var path = TriffSkillsPaths.StatePath;
+        if (!File.Exists(path)) return new StateLoadResult(new TriffSkillsState(), string.Empty);
+
         try
         {
-            if (!File.Exists(TriffSkillsPaths.StatePath)) return new TriffSkillsState();
-            var state = JsonSerializer.Deserialize<TriffSkillsState>(
-                File.ReadAllText(TriffSkillsPaths.StatePath),
-                TriffSkillsJson.Options
-            );
-            return state?.Normalize() ?? new TriffSkillsState();
+            return new StateLoadResult(Deserialize(AtomicFile.ReadBoundedText(path, MaxStateFileBytes)), string.Empty);
         }
-        catch
+        catch (Exception primaryJson) when (primaryJson is JsonException or InvalidDataException or System.Text.DecoderFallbackException)
         {
-            return new TriffSkillsState();
+            string preserved = string.Empty;
+            try { preserved = AtomicFile.PreserveCorrupt(path); }
+            catch (Exception preserveError) when (IsFileFailure(preserveError))
+            {
+                return new StateLoadResult(new TriffSkillsState(), $"State JSON is corrupt and could not be preserved: {preserveError.Message}");
+            }
+
+            var backup = path + ".bak";
+            if (File.Exists(backup))
+            {
+                try
+                {
+                    var recovered = Deserialize(AtomicFile.ReadBoundedText(backup, MaxStateFileBytes));
+                    AtomicFile.WriteText(path, JsonSerializer.Serialize(recovered, TriffSkillsJson.Options));
+                    return new StateLoadResult(recovered, $"Recovered corrupt state from last-known-good backup. Corrupt file: {preserved}");
+                }
+                catch (Exception backupError) when (backupError is JsonException or InvalidDataException or System.Text.DecoderFallbackException || IsFileFailure(backupError))
+                {
+                    return new StateLoadResult(new TriffSkillsState(), $"State and backup are unreadable. Corrupt file: {preserved}. Backup: {backupError.Message}");
+                }
+            }
+            return new StateLoadResult(new TriffSkillsState(), $"State JSON was corrupt and preserved at {preserved}. No backup was available. {primaryJson.Message}");
+        }
+        catch (Exception exception) when (IsFileFailure(exception))
+        {
+            return new StateLoadResult(new TriffSkillsState(), $"Could not read TriffSkills state: {exception.Message}");
         }
     }
 
-    // Best-effort save for refresh passes: a transient write failure (antivirus lock,
-    // redirected profile) must not abort the pass that called it - the in-memory state
-    // is still correct and the next save retries.
-    public void Save()
-    {
-        if (!TrySave(out var error))
-        {
-            Debug.WriteLine($"TriffSkills: state save failed: {error}");
-        }
-    }
-
-    // The authentication commit path uses this directly: a refresh token must not be
-    // written to Credential Manager unless the character row it belongs to was durably
-    // persisted first, so that path needs to know whether the save actually landed.
-    //
-    // Write-temp-then-replace so a crash mid-write leaves the previous file rather than
-    // a truncated one. The temp name is unique per save so concurrent saves cannot
-    // consume each other's file; the last Replace wins, which is the intended semantics
-    // for a full-state snapshot.
     public bool TrySave(out string error)
     {
-        var tempPath = $"{TriffSkillsPaths.StatePath}.{Guid.NewGuid():N}.tmp";
         try
         {
-            Directory.CreateDirectory(TriffSkillsPaths.Root);
-            var json = JsonSerializer.Serialize(Normalize(), TriffSkillsJson.Options);
-
-            File.WriteAllText(tempPath, json, new UTF8Encoding(false));
-            if (File.Exists(TriffSkillsPaths.StatePath))
-            {
-                File.Replace(tempPath, TriffSkillsPaths.StatePath, null);
-            }
-            else
-            {
-                File.Move(tempPath, TriffSkillsPaths.StatePath);
-            }
-
-            error = "";
+            Normalize();
+            AtomicFile.WriteText(TriffSkillsPaths.StatePath, JsonSerializer.Serialize(this, TriffSkillsJson.Options));
+            error = string.Empty;
             return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        catch (Exception exception) when (IsFileFailure(exception) || exception is JsonException)
         {
-            error = ex.Message;
-            TryDelete(tempPath);
+            error = exception.Message;
             return false;
-        }
-    }
-
-    private static void TryDelete(string path)
-    {
-        try
-        {
-            if (File.Exists(path)) File.Delete(path);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // A stray temp file is strictly better than throwing out of a cleanup path.
         }
     }
 
     public TriffSkillsState Normalize()
     {
         var deduped = new Dictionary<long, TriffSkillsCharacter>();
-        foreach (var character in Characters ?? new List<TriffSkillsCharacter>())
+        foreach (var character in (Characters ?? []).Take(MaxCharacters * 2))
         {
-            if (character == null || character.CharacterId <= 0) continue;
-            character.CharacterName = character.CharacterName?.Trim() ?? "";
-            character.Scopes ??= new List<string>();
-            character.TrainedLevels ??= new Dictionary<int, int>();
-            character.Queue ??= new List<QueueEntry>();
-            character.Error = character.Error?.Trim() ?? "";
-            deduped[character.CharacterId] = character;   // last wins
+            if (character is null || character.CharacterId <= 0) continue;
+            character.CharacterName = (character.CharacterName ?? string.Empty).Trim();
+            character.OwnerHash = (character.OwnerHash ?? string.Empty).Trim();
+            character.Scopes = (character.Scopes ?? []).Where(scope => !string.IsNullOrWhiteSpace(scope)).Distinct(StringComparer.Ordinal).Take(100).ToList();
+            character.ActiveLevels = NormalizeLevels(character.ActiveLevels);
+            character.TrainedLevels = NormalizeLevels(character.TrainedLevels);
+            character.Queue = (character.Queue ?? []).Where(entry => entry.SkillId > 0 && entry.FinishedLevel is >= 1 and <= 5).Take(500).ToList();
+            character.Error = (character.Error ?? string.Empty).Trim();
+            deduped[character.CharacterId] = character;
         }
 
-        Characters = deduped.Values.ToList();
-        if (!deduped.ContainsKey(SelectedCharacterId))
-        {
-            SelectedCharacterId = Characters.FirstOrDefault()?.CharacterId ?? 0;
-        }
-
+        Characters = deduped.Values.Take(MaxCharacters).ToList();
+        if (!deduped.ContainsKey(SelectedCharacterId)) SelectedCharacterId = Characters.FirstOrDefault()?.CharacterId ?? 0;
         return this;
     }
 
+    public TriffSkillsCharacter? Find(long characterId)
+        => characterId <= 0 ? null : Characters.FirstOrDefault(character => character.CharacterId == characterId);
+
     public TriffSkillsCharacter Upsert(long characterId)
     {
-        var existing = Characters.FirstOrDefault(character => character.CharacterId == characterId);
-        if (existing != null) return existing;
-
+        var existing = Find(characterId);
+        if (existing is not null) return existing;
+        if (Characters.Count >= MaxCharacters) throw new InvalidOperationException($"TriffSkills supports up to {MaxCharacters} characters.");
         var added = new TriffSkillsCharacter { CharacterId = characterId };
         Characters.Add(added);
         return added;
     }
 
-    // Both Apply* methods look the character up instead of upserting, and do nothing
-    // when it is gone: Forget character can complete during a refresh pass's await, and
-    // upserting here would re-add a character whose credential was just destroyed.
-    // Adding characters is the authorization path's job.
-    private TriffSkillsCharacter? Find(long characterId)
-    {
-        return characterId <= 0
-            ? null
-            : Characters.FirstOrDefault(character => character.CharacterId == characterId);
-    }
-
-    public void ApplyFetchSuccess(long characterId, Dictionary<int, int>? trainedLevels, List<QueueEntry>? queue)
+    public void ApplyFetchSuccess(
+        long characterId,
+        IReadOnlyDictionary<int, int> activeLevels,
+        IReadOnlyDictionary<int, int> trainedLevels,
+        IReadOnlyList<QueueEntry> queue,
+        DateTimeOffset fetchedUtc)
     {
         var character = Find(characterId);
-        if (character == null) return;
-
-        // Copied rather than aliased so later caller-side mutation cannot silently
-        // edit persisted state.
-        character.TrainedLevels = trainedLevels == null
-            ? new Dictionary<int, int>()
-            : new Dictionary<int, int>(trainedLevels);
-        character.Queue = queue == null ? new List<QueueEntry>() : new List<QueueEntry>(queue);
-        character.FetchedUtc = DateTimeOffset.UtcNow;
-        character.Error = "";
+        if (character is null) return;
+        character.ActiveLevels = new Dictionary<int, int>(activeLevels);
+        character.TrainedLevels = new Dictionary<int, int>(trainedLevels);
+        character.Queue = [.. queue];
+        character.FetchedUtc = fetchedUtc;
+        character.Error = string.Empty;
         character.NeedsReauth = false;
     }
 
     public void ApplyFetchFailure(long characterId, string error, bool needsReauth)
     {
         var character = Find(characterId);
-        if (character == null) return;
-
-        // TrainedLevels, Queue and FetchedUtc stay untouched so the last-good record
-        // remains scoreable; the UI labels it stale by FetchedUtc.
-        character.Error = string.IsNullOrWhiteSpace(error) ? "ESI request failed." : error.Trim();
-        character.NeedsReauth = needsReauth;
+        if (character is null) return;
+        character.Error = string.IsNullOrWhiteSpace(error) ? "Refresh failed." : error.Trim();
+        character.NeedsReauth = character.NeedsReauth || needsReauth;
     }
+
+    private static Dictionary<int, int> NormalizeLevels(Dictionary<int, int>? source)
+        => (source ?? []).Where(pair => pair.Key > 0 && pair.Value is >= 0 and <= 5).Take(20_000).ToDictionary(pair => pair.Key, pair => pair.Value);
+
+    private static TriffSkillsState Deserialize(string json)
+        => (JsonSerializer.Deserialize<TriffSkillsState>(json, TriffSkillsJson.Options)
+            ?? throw new JsonException("State JSON was empty.")).Normalize();
+
+    private static bool IsFileFailure(Exception exception)
+        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
 }

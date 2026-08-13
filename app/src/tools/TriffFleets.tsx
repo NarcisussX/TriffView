@@ -106,6 +106,7 @@ type TriffFleetsState = {
   profiles: FleetProfile[];
   dryRun: DryRunPlan | null;
   applyResult: ApplySummary | null;
+  startupWarning: string;
   complianceNote: string;
 };
 
@@ -123,6 +124,7 @@ const EMPTY_STATE: TriffFleetsState = {
   profiles: [],
   dryRun: null,
   applyResult: null,
+  startupWarning: "",
   complianceNote: "Uses ESI only. Does not control EVE clients. Characters accept invites manually in-game.",
 };
 
@@ -343,6 +345,13 @@ export default function TriffFleets() {
               <button type="button" onClick={() => setError("")}>
                 Clear
               </button>
+            </div>
+          ) : null}
+
+          {state.startupWarning ? (
+            <div className="triffview-warning">
+              <strong>Fleet Manager recovery</strong>
+              <span>{state.startupWarning}</span>
             </div>
           ) : null}
 

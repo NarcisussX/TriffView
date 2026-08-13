@@ -1,36 +1,33 @@
-using System.Diagnostics;
+using System.Collections.Concurrent;
+using System.Globalization;
 using System.IO;
 using System.Net;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Net.Sockets;
-using System.Runtime.InteropServices;
-using System.Runtime.InteropServices.ComTypes;
-using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using System.Text.Json.Serialization;
 using System.Windows.Threading;
+using TriffView.Eve;
 using Forms = System.Windows.Forms;
 
 namespace TriffView.TriffFleets;
 
-internal sealed class TriffFleetsController
+internal sealed class TriffFleetsController : IDisposable
 {
     private const string ClientId = "7d2454c3191c4254a4b67d8f71f2b972";
     private const string RedirectUri = "http://127.0.0.1:51777/trifffleets/callback/";
-    private const string AuthorizeEndpoint = "https://login.eveonline.com/v2/oauth/authorize";
-    private const string TokenEndpoint = "https://login.eveonline.com/v2/oauth/token";
-    private const string EsiBaseUrl = "https://esi.evetech.net/latest";
+    internal const string CredentialPrefix = "TriffView.TriffFleets.RefreshToken.";
+    private const string UserAgent = "TriffView/1.6.2 (+https://github.com/NarcisussX/TriffView)";
     private const string Scopes = "esi-fleets.read_fleet.v1 esi-fleets.write_fleet.v1";
+    private static readonly HashSet<string> RequiredScopes = new(Scopes.Split(' '), StringComparer.Ordinal);
+    private static readonly TimeSpan AuthTimeout = TimeSpan.FromMinutes(5);
     private const int WriteThrottleMs = 250;
     private const int MemberWriteConcurrency = 4;
     private const int MemberMoveSettleBeforePruneMs = 1200;
     private const int StructureSettleBeforeMemberReadMs = 1000;
     private const int CleanupDeleteConcurrency = 6;
-    private const int EsiTransientMaxAttempts = 3;
-    private const int EsiTransientBaseDelayMs = 650;
     private const int FleetStructureNameMaxLength = 10;
     private const string BenchWingName = "Bench";
     private const string BenchSquadName = "Waiting";
@@ -48,19 +45,83 @@ internal sealed class TriffFleetsController
 
     private readonly Dispatcher _dispatcher;
     private readonly Action<object> _postToHud;
+    private readonly ICredentialStore _credentials;
+    private readonly EsiClient _esi;
+    private readonly IEveSsoClient _sso;
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly SemaphoreSlim _authGate = new(1, 1);
     private readonly TriffFleetsLocalState _state;
-    private readonly Dictionary<long, AccessTokenCache> _accessTokens = new();
+    private readonly ConcurrentDictionary<long, AccessTokenCache> _accessTokens = new();
+    private readonly ConcurrentDictionary<long, SemaphoreSlim> _tokenLocks = new();
     private LiveFleetInfo? _liveFleet;
     private FleetDryRunPlan? _lastPlan;
     private FleetApplySummary? _lastApply;
     private bool _authInProgress;
+    private CancellationTokenSource? _authCancellation;
     private string _lastPostedStateJson = "";
+    private string _startupWarning = "";
 
     public TriffFleetsController(Dispatcher dispatcher, Action<object> postToHud)
+        : this(dispatcher, postToHud, new WindowsCredentialStore(), CreateEsiClient(), CreateSsoClient())
+    {
+    }
+
+    internal TriffFleetsController(
+        Dispatcher dispatcher,
+        Action<object> postToHud,
+        ICredentialStore credentials,
+        EsiClient esi,
+        IEveSsoClient sso)
     {
         _dispatcher = dispatcher;
         _postToHud = postToHud;
+        _credentials = credentials;
+        _esi = esi;
+        _sso = sso;
         _state = TriffFleetsLocalState.Load();
+        _startupWarning = _state.LoadWarning;
+        RecoverOwnCredentials();
+    }
+
+    private static EsiClient CreateEsiClient() => new(Http, JsonOptions, UserAgent);
+
+    private void RecoverOwnCredentials()
+    {
+        try
+        {
+            var added = false;
+            foreach (var target in _credentials.EnumerateTargets(CredentialPrefix))
+            {
+                var suffix = target[CredentialPrefix.Length..];
+                if (!long.TryParse(suffix, NumberStyles.None, CultureInfo.InvariantCulture, out var characterId)
+                    || characterId <= 0
+                    || _state.Bosses.Any(boss => boss.CharacterId == characterId)) continue;
+                _state.Bosses.Add(new FleetBossAuth
+                {
+                    CharacterId = characterId,
+                    CharacterName = $"Recovered character {characterId}",
+                });
+                added = true;
+            }
+            if (!added) return;
+            _state.SelectedBossCharacterId = _state.Bosses.First().CharacterId;
+            _state.Save();
+            AppendStartupWarning("Recovered Fleet Manager credential entries whose state rows were missing. Refresh or forget those characters.");
+        }
+        catch (Exception exception)
+        {
+            AppendStartupWarning($"Could not inspect or recover the Fleet Manager credential namespace: {exception.Message}");
+        }
+    }
+
+    private void AppendStartupWarning(string warning)
+        => _startupWarning = string.IsNullOrWhiteSpace(_startupWarning) ? warning : $"{_startupWarning} {warning}";
+
+    private static IEveSsoClient CreateSsoClient()
+    {
+        var keys = new EveSigningKeySource(Http);
+        var validator = new EveJwtValidator(ClientId, RequiredScopes, keys);
+        return new EveSsoClient(Http, new EveSsoOptions(ClientId, RedirectUri, RequiredScopes, UserAgent, "TriffFleets"), validator);
     }
 
     public bool HandleWebMessage(string type, JsonObject? message)
@@ -73,38 +134,41 @@ internal sealed class TriffFleetsController
             case "trifffleets:start-auth":
                 _ = StartAuthAsync();
                 return true;
+            case "trifffleets:cancel-auth":
+                _authCancellation?.Cancel();
+                return true;
             case "trifffleets:select-boss":
                 SelectBoss(ReadLong(message, "characterId"));
                 return true;
             case "trifffleets:forget-boss":
-                ForgetBoss(ReadLong(message, "characterId"));
+                _ = ForgetBossAsync(ReadLong(message, "characterId"));
                 return true;
             case "trifffleets:detect-fleet":
                 _ = DetectFleetAsync();
                 return true;
             case "trifffleets:create-profile":
-                CreateProfile(message?["name"]?.GetValue<string>());
+                CreateProfile(ReadString(message, "name", 120));
                 return true;
             case "trifffleets:select-profile":
-                SelectProfile(message?["profileId"]?.GetValue<string>());
+                SelectProfile(ReadString(message, "profileId", 64));
                 return true;
             case "trifffleets:save-profile":
                 SaveProfile(message?["profile"] as JsonObject);
                 return true;
             case "trifffleets:delete-profile":
-                DeleteProfile(message?["profileId"]?.GetValue<string>());
+                DeleteProfile(ReadString(message, "profileId", 64));
                 return true;
             case "trifffleets:import-profile-json":
                 ImportProfileJson();
                 return true;
             case "trifffleets:export-profile-json":
-                ExportProfileJson(message?["profileId"]?.GetValue<string>());
+                ExportProfileJson(ReadString(message, "profileId", 64));
                 return true;
             case "trifffleets:refresh-character-cache":
                 _ = BuildPlanAsync(refreshCharacters: true);
                 return true;
             case "trifffleets:build-plan":
-                _ = BuildPlanAsync(refreshCharacters: message?["refreshCharacters"]?.GetValue<bool>() == true);
+                _ = BuildPlanAsync(refreshCharacters: ReadBool(message, "refreshCharacters"));
                 return true;
             case "trifffleets:apply-plan":
                 _ = ApplyPlanAsync();
@@ -127,6 +191,14 @@ internal sealed class TriffFleetsController
         }
     }
 
+    private static string ReadString(JsonObject? message, string key, int maxLength)
+        => message?[key] is JsonValue value && value.TryGetValue<string>(out var text)
+            ? text[..Math.Min(text.Length, maxLength)]
+            : string.Empty;
+
+    private static bool ReadBool(JsonObject? message, string key)
+        => message?[key] is JsonValue value && value.TryGetValue<bool>(out var result) && result;
+
     private void SelectBoss(long characterId)
     {
         if (characterId <= 0 || _state.Bosses.All(boss => boss.CharacterId != characterId)) return;
@@ -138,21 +210,71 @@ internal sealed class TriffFleetsController
         PostState(force: true);
     }
 
-    private void ForgetBoss(long characterId)
+    public void Dispose()
+    {
+        _lifetime.Cancel();
+        _authCancellation?.Cancel();
+        _authCancellation?.Dispose();
+        _lifetime.Dispose();
+        // Do not dispose gates that a cancellation-aware in-flight operation may
+        // still be unwinding through.
+    }
+
+    private async Task ForgetBossAsync(long characterId)
     {
         if (characterId <= 0) return;
-        CredentialStore.Delete(RefreshTokenTarget(characterId));
-        _state.Bosses.RemoveAll(boss => boss.CharacterId == characterId);
-        if (_state.SelectedBossCharacterId == characterId)
+        var gate = _tokenLocks.GetOrAdd(characterId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(_lifetime.Token);
+        var target = RefreshTokenTarget(characterId);
+        var bossIndex = -1;
+        FleetBossAuth? removedBoss = null;
+        var oldSelected = _state.SelectedBossCharacterId;
+        AccessTokenCache? oldAccess = null;
+        string? oldCredential = null;
+        try
         {
-            _state.SelectedBossCharacterId = _state.Bosses.FirstOrDefault()?.CharacterId ?? 0;
+            oldCredential = _credentials.Read(target);
+            bossIndex = _state.Bosses.FindIndex(boss => boss.CharacterId == characterId);
+            if (bossIndex < 0) return;
+            removedBoss = _state.Bosses[bossIndex].Clone();
+            _accessTokens.TryGetValue(characterId, out oldAccess);
+
+            _credentials.Delete(target);
+            _state.Bosses.RemoveAt(bossIndex);
+            if (_state.SelectedBossCharacterId == characterId)
+            {
+                _state.SelectedBossCharacterId = _state.Bosses.FirstOrDefault()?.CharacterId ?? 0;
+            }
+            _accessTokens.TryRemove(characterId, out _);
+            _liveFleet = null;
+            _lastPlan = null;
+            _lastApply = null;
+            _state.Save();
+            PostState(force: true);
         }
-        _accessTokens.Remove(characterId);
-        _liveFleet = null;
-        _lastPlan = null;
-        _lastApply = null;
-        _state.Save();
-        PostState(force: true);
+        catch (Exception exception)
+        {
+            var rollbackError = string.Empty;
+            try
+            {
+                if (removedBoss is not null && _state.Bosses.All(boss => boss.CharacterId != characterId))
+                {
+                    _state.Bosses.Insert(Math.Min(Math.Max(0, bossIndex), _state.Bosses.Count), removedBoss);
+                }
+                _state.SelectedBossCharacterId = oldSelected;
+                if (oldAccess is not null) _accessTokens[characterId] = oldAccess;
+                if (!string.IsNullOrWhiteSpace(oldCredential)) _credentials.Write(target, oldCredential);
+            }
+            catch (Exception rollback)
+            {
+                rollbackError = $" Rollback also failed: {rollback.Message}";
+            }
+            PostError("forget-boss", $"The fleet boss could not be forgotten: {exception.Message}{rollbackError}");
+        }
+        finally
+        {
+            gate.Release();
+        }
     }
 
     private void CreateProfile(string? name)
@@ -248,7 +370,7 @@ internal sealed class TriffFleetsController
 
             try
             {
-                var profile = JsonSerializer.Deserialize<FleetProfile>(File.ReadAllText(dialog.FileName), JsonOptions)?.Normalize();
+                var profile = JsonSerializer.Deserialize<FleetProfile>(AtomicFile.ReadBoundedText(dialog.FileName, 1024 * 1024), JsonOptions)?.Normalize();
                 if (profile == null) throw new InvalidDataException("Profile JSON was empty.");
                 profile.Id = Guid.NewGuid().ToString("N");
                 if (string.IsNullOrWhiteSpace(profile.Name)) profile.Name = Path.GetFileNameWithoutExtension(dialog.FileName);
@@ -307,275 +429,157 @@ internal sealed class TriffFleetsController
 
     private async Task StartAuthAsync()
     {
-        if (_authInProgress)
+        if (!await _authGate.WaitAsync(0, _lifetime.Token))
         {
             PostError("auth", "Fleet boss authentication is already in progress.");
             return;
         }
-
-        if (string.IsNullOrWhiteSpace(ClientId))
-        {
-            PostError("auth", "TriffFleets needs a registered EVE SSO client ID before fleet boss authentication can run. Register the TriffView app in the EVE developer portal and set the built-in client ID in TriffFleetsController.");
-            PostState(force: true);
-            return;
-        }
-
         _authInProgress = true;
+        _authCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetime.Token);
         PostState(force: true);
-
-        using var listener = new TcpListener(IPAddress.Loopback, 51777);
         try
         {
-            var state = Base64Url(RandomNumberGenerator.GetBytes(32));
-            var verifier = Base64Url(RandomNumberGenerator.GetBytes(32));
-            var challenge = Base64Url(SHA256.HashData(Encoding.ASCII.GetBytes(verifier)));
-            listener.Start();
+            var token = await _sso.AuthorizeAsync(AuthTimeout, _authCancellation.Token);
+            CommitAuthentication(token);
+            var identity = token.Identity;
+            _accessTokens[identity.CharacterId] = Cache(token);
+            _liveFleet = null;
+            _lastPlan = null;
+            _lastApply = null;
+            PostState(force: true);
+        }
+        catch (OperationCanceledException)
+        {
+            PostError("auth", "EVE SSO authentication was cancelled.");
+        }
+        catch (TimeoutException exception)
+        {
+            PostError("auth", exception.Message);
+        }
+        catch (SocketException exception)
+        {
+            PostError("auth", $"Could not open the local SSO callback listener at {RedirectUri}. {exception.Message}");
+        }
+        catch (Exception exception)
+        {
+            PostError("auth", exception.Message);
+        }
+        finally
+        {
+            _authInProgress = false;
+            _authCancellation?.Dispose();
+            _authCancellation = null;
+            PostState(force: true);
+            _authGate.Release();
+        }
+    }
 
-            var authUrl = BuildAuthorizeUrl(state, challenge);
-            Process.Start(new ProcessStartInfo(authUrl) { UseShellExecute = true });
-
-            var contextTask = listener.AcceptTcpClientAsync();
-            var completed = await Task.WhenAny(contextTask, Task.Delay(TimeSpan.FromMinutes(5)));
-            if (completed != contextTask)
-            {
-                PostError("auth", "EVE SSO authentication timed out.");
-                return;
-            }
-
-            using var client = await contextTask;
-            await using var stream = client.GetStream();
-            var callbackUrl = await ReadCallbackUrlAsync(stream);
-            var query = ParseQuery(callbackUrl.Query);
-            var error = query.TryGetValue("error", out var errorValue) ? errorValue : "";
-            var code = query.TryGetValue("code", out var codeValue) ? codeValue : "";
-            var returnedState = query.TryGetValue("state", out var stateValue) ? stateValue : "";
-
-            if (!string.IsNullOrWhiteSpace(error))
-            {
-                await WriteCallbackHtmlAsync(stream, "TriffFleets authentication was cancelled or denied. You can close this tab.");
-                PostError("auth", $"EVE SSO returned: {error}");
-                return;
-            }
-
-            if (!string.Equals(state, returnedState, StringComparison.Ordinal))
-            {
-                await WriteCallbackHtmlAsync(stream, "TriffFleets blocked this login because the SSO state did not match. You can close this tab.");
-                PostError("auth", "EVE SSO state did not match. Authentication was blocked.");
-                return;
-            }
-
-            if (string.IsNullOrWhiteSpace(code))
-            {
-                await WriteCallbackHtmlAsync(stream, "TriffFleets did not receive an authorization code. You can close this tab.");
-                PostError("auth", "EVE SSO did not return an authorization code.");
-                return;
-            }
-
-            var token = await ExchangeCodeAsync(code, verifier);
-            var identity = DecodeEveJwt(token.AccessToken);
-            if (identity.CharacterId <= 0)
-            {
-                throw new InvalidDataException("The EVE SSO token did not include a character ID.");
-            }
-
-            if (!identity.Scopes.Contains("esi-fleets.read_fleet.v1") || !identity.Scopes.Contains("esi-fleets.write_fleet.v1"))
-            {
-                throw new InvalidDataException("The selected character did not grant the required fleet scopes.");
-            }
-
-            if (string.IsNullOrWhiteSpace(token.RefreshToken))
-            {
-                throw new InvalidDataException("EVE SSO did not return a refresh token.");
-            }
-
-            CredentialStore.Write(RefreshTokenTarget(identity.CharacterId), token.RefreshToken);
-            _accessTokens[identity.CharacterId] = new AccessTokenCache(token.AccessToken, DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn - 60)));
-
-            var existing = _state.Bosses.FirstOrDefault(boss => boss.CharacterId == identity.CharacterId);
+    private void CommitAuthentication(EveValidatedToken token)
+    {
+        if (string.IsNullOrWhiteSpace(token.RefreshToken)) throw new InvalidDataException("EVE SSO did not return a refresh token.");
+        var identity = token.Identity;
+        var target = RefreshTokenTarget(identity.CharacterId);
+        var oldCredential = _credentials.Read(target);
+        var existing = _state.Bosses.FirstOrDefault(boss => boss.CharacterId == identity.CharacterId);
+        var oldBoss = existing is null ? null : existing.Clone();
+        var oldSelected = _state.SelectedBossCharacterId;
+        try
+        {
+            _credentials.Write(target, token.RefreshToken);
             if (existing == null)
             {
                 _state.Bosses.Add(new FleetBossAuth
                 {
                     CharacterId = identity.CharacterId,
                     CharacterName = identity.CharacterName,
-                    Scopes = identity.Scopes.ToList(),
+                    OwnerHash = identity.OwnerHash,
+                    Scopes = identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList(),
                     AuthenticatedUtc = DateTimeOffset.UtcNow,
                 });
             }
             else
             {
                 existing.CharacterName = identity.CharacterName;
-                existing.Scopes = identity.Scopes.ToList();
+                existing.OwnerHash = identity.OwnerHash;
+                existing.Scopes = identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
                 existing.AuthenticatedUtc = DateTimeOffset.UtcNow;
             }
-
             _state.SelectedBossCharacterId = identity.CharacterId;
             _state.Save();
-            _liveFleet = null;
-            _lastPlan = null;
-            _lastApply = null;
-            await WriteCallbackHtmlAsync(stream, "TriffFleets authentication complete. You can close this tab and return to TriffView.");
-            PostState(force: true);
         }
-        catch (SocketException ex)
+        catch
         {
-            PostError("auth", $"Could not open the local SSO callback listener at {RedirectUri}. {ex.Message}");
+            if (existing is null) _state.Bosses.RemoveAll(boss => boss.CharacterId == identity.CharacterId);
+            else existing.CopyFrom(oldBoss!);
+            _state.SelectedBossCharacterId = oldSelected;
+            if (string.IsNullOrWhiteSpace(oldCredential)) _credentials.Delete(target);
+            else _credentials.Write(target, oldCredential);
+            throw;
         }
-        catch (Exception ex)
+    }
+
+    private async Task<FleetAccessToken> AccessTokenForSelectedBossAsync()
+    {
+        var boss = SelectedBoss() ?? throw new InvalidOperationException("Authenticate or select a fleet boss first.");
+        return await AccessTokenForBossAsync(boss.CharacterId, forceRefresh: false, rejectedAccessToken: null);
+    }
+
+    private async Task<FleetAccessToken> AccessTokenForBossAsync(long characterId, bool forceRefresh, string? rejectedAccessToken)
+    {
+        var boss = _state.Bosses.FirstOrDefault(item => item.CharacterId == characterId)
+            ?? throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "This fleet boss needs to authenticate again.");
+        if (_accessTokens.TryGetValue(boss.CharacterId, out var cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30))
         {
-            PostError("auth", ex.Message);
+            if (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal))
+            {
+                return new FleetAccessToken(characterId, cached.AccessToken);
+            }
+        }
+        var gate = _tokenLocks.GetOrAdd(boss.CharacterId, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(_lifetime.Token);
+        try
+        {
+            if (_accessTokens.TryGetValue(boss.CharacterId, out cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30)
+                && (!forceRefresh || !string.Equals(cached.AccessToken, rejectedAccessToken, StringComparison.Ordinal)))
+            {
+                return new FleetAccessToken(characterId, cached.AccessToken);
+            }
+            if (forceRefresh) _accessTokens.TryRemove(boss.CharacterId, out _);
+            var oldRefresh = _credentials.Read(RefreshTokenTarget(boss.CharacterId));
+            if (string.IsNullOrWhiteSpace(oldRefresh)) throw new OAuthTokenException(HttpStatusCode.Unauthorized, "invalid_grant", "This fleet boss needs to authenticate again.");
+            var token = await _sso.RefreshAsync(oldRefresh, _lifetime.Token);
+            if (token.Identity.CharacterId != boss.CharacterId) throw new OAuthTokenException(HttpStatusCode.Unauthorized, "identity_mismatch", "Refreshed token belongs to a different character.");
+            if (!string.IsNullOrWhiteSpace(boss.OwnerHash) && !string.Equals(boss.OwnerHash, token.Identity.OwnerHash, StringComparison.Ordinal))
+            {
+                throw new OAuthTokenException(HttpStatusCode.Unauthorized, "owner_changed", "Character ownership changed; authenticate again.");
+            }
+            var rotated = string.IsNullOrWhiteSpace(token.RefreshToken) ? oldRefresh : token.RefreshToken;
+            if (!string.Equals(rotated, oldRefresh, StringComparison.Ordinal)) _credentials.Write(RefreshTokenTarget(boss.CharacterId), rotated);
+            var oldBoss = boss.Clone();
+            boss.CharacterName = token.Identity.CharacterName;
+            boss.OwnerHash = token.Identity.OwnerHash;
+            boss.Scopes = token.Identity.Scopes.OrderBy(scope => scope, StringComparer.Ordinal).ToList();
+            boss.AuthenticatedUtc = DateTimeOffset.UtcNow;
+            try
+            {
+                _state.Save();
+            }
+            catch
+            {
+                boss.CopyFrom(oldBoss);
+                throw;
+            }
+            _accessTokens[boss.CharacterId] = Cache(token);
+            return new FleetAccessToken(characterId, token.AccessToken);
         }
         finally
         {
-            _authInProgress = false;
-            listener.Stop();
-            PostState(force: true);
+            gate.Release();
         }
     }
 
-    private static async Task<Uri> ReadCallbackUrlAsync(NetworkStream stream)
-    {
-        using var reader = new StreamReader(stream, Encoding.ASCII, leaveOpen: true);
-        var requestLine = await reader.ReadLineAsync() ?? "";
-        var parts = requestLine.Split(' ', StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length < 2)
-        {
-            throw new InvalidDataException("Local SSO callback was not a valid HTTP request.");
-        }
-
-        while (!string.IsNullOrEmpty(await reader.ReadLineAsync()))
-        {
-            // Drain headers before writing the callback page.
-        }
-
-        return new Uri(new Uri(RedirectUri), parts[1]);
-    }
-
-    private static async Task WriteCallbackHtmlAsync(NetworkStream stream, string message)
-    {
-        var html = $"""
-        <!doctype html>
-        <html>
-        <head><meta charset="utf-8"><title>TriffFleets</title></head>
-        <body style="margin:0;background:#05070b;color:#d9e2ee;font-family:Segoe UI,Arial,sans-serif;">
-          <main style="max-width:520px;margin:80px auto;border:1px solid #303640;background:#090d14;padding:24px;">
-            <h1 style="color:#53b6ff;font-size:18px;text-transform:uppercase;">TriffFleets</h1>
-            <p>{WebUtility.HtmlEncode(message)}</p>
-          </main>
-        </body>
-        </html>
-        """;
-        var body = Encoding.UTF8.GetBytes(html);
-        var header = Encoding.ASCII.GetBytes(
-            "HTTP/1.1 200 OK\r\n" +
-            "Content-Type: text/html; charset=utf-8\r\n" +
-            $"Content-Length: {body.Length}\r\n" +
-            "Connection: close\r\n\r\n"
-        );
-        await stream.WriteAsync(header);
-        await stream.WriteAsync(body);
-    }
-
-    private static string BuildAuthorizeUrl(string state, string challenge)
-    {
-        var query = new Dictionary<string, string>
-        {
-            ["response_type"] = "code",
-            ["redirect_uri"] = RedirectUri,
-            ["client_id"] = ClientId,
-            ["scope"] = Scopes,
-            ["state"] = state,
-            ["code_challenge"] = challenge,
-            ["code_challenge_method"] = "S256",
-        };
-        return $"{AuthorizeEndpoint}?{BuildQuery(query)}";
-    }
-
-    private static string BuildQuery(Dictionary<string, string> values)
-    {
-        return string.Join("&", values.Select(pair => $"{Uri.EscapeDataString(pair.Key)}={Uri.EscapeDataString(pair.Value)}"));
-    }
-
-    private static Dictionary<string, string> ParseQuery(string query)
-    {
-        var result = new Dictionary<string, string>(StringComparer.Ordinal);
-        query = query.TrimStart('?');
-        foreach (var part in query.Split('&', StringSplitOptions.RemoveEmptyEntries))
-        {
-            var pieces = part.Split('=', 2);
-            var key = Uri.UnescapeDataString(pieces[0].Replace("+", " "));
-            var value = pieces.Length > 1 ? Uri.UnescapeDataString(pieces[1].Replace("+", " ")) : "";
-            result[key] = value;
-        }
-        return result;
-    }
-
-    private async Task<TokenResponse> ExchangeCodeAsync(string code, string verifier)
-    {
-        var form = new Dictionary<string, string>
-        {
-            ["grant_type"] = "authorization_code",
-            ["code"] = code,
-            ["client_id"] = ClientId,
-            ["code_verifier"] = verifier,
-            ["redirect_uri"] = RedirectUri,
-        };
-        return await SendTokenRequestAsync(form);
-    }
-
-    private async Task<TokenResponse> RefreshTokenAsync(long characterId)
-    {
-        var refreshToken = CredentialStore.Read(RefreshTokenTarget(characterId));
-        if (string.IsNullOrWhiteSpace(refreshToken))
-        {
-            throw new InvalidOperationException("This fleet boss needs to authenticate again.");
-        }
-
-        var form = new Dictionary<string, string>
-        {
-            ["grant_type"] = "refresh_token",
-            ["refresh_token"] = refreshToken,
-            ["client_id"] = ClientId,
-        };
-        var token = await SendTokenRequestAsync(form);
-        if (!string.IsNullOrWhiteSpace(token.RefreshToken))
-        {
-            CredentialStore.Write(RefreshTokenTarget(characterId), token.RefreshToken);
-        }
-        _accessTokens[characterId] = new AccessTokenCache(token.AccessToken, DateTimeOffset.UtcNow.AddSeconds(Math.Max(60, token.ExpiresIn - 60)));
-        return token;
-    }
-
-    private static async Task<TokenResponse> SendTokenRequestAsync(Dictionary<string, string> form)
-    {
-        using var request = new HttpRequestMessage(HttpMethod.Post, TokenEndpoint)
-        {
-            Content = new FormUrlEncodedContent(form),
-        };
-        request.Headers.UserAgent.ParseAdd("TriffView/1.0 TriffFleets");
-
-        using var response = await Http.SendAsync(request);
-        var text = await response.Content.ReadAsStringAsync();
-        if (!response.IsSuccessStatusCode)
-        {
-            throw new InvalidOperationException($"EVE SSO returned {(int)response.StatusCode}: {ReadError(text)}");
-        }
-
-        return JsonSerializer.Deserialize<TokenResponse>(text, JsonOptions)
-            ?? throw new InvalidDataException("EVE SSO returned an empty token response.");
-    }
-
-    private async Task<string> AccessTokenForSelectedBossAsync()
-    {
-        var boss = SelectedBoss() ?? throw new InvalidOperationException("Authenticate or select a fleet boss first.");
-        if (_accessTokens.TryGetValue(boss.CharacterId, out var cached) && cached.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30))
-        {
-            return cached.AccessToken;
-        }
-
-        var token = await RefreshTokenAsync(boss.CharacterId);
-        return token.AccessToken;
-    }
+    private static AccessTokenCache Cache(EveValidatedToken token)
+        => new(token.AccessToken, DateTimeOffset.UtcNow.AddSeconds(Math.Max(30, token.ExpiresIn - 60)));
 
     private async Task DetectFleetAsync()
     {
@@ -583,7 +587,7 @@ internal sealed class TriffFleetsController
         {
             var boss = SelectedBoss() ?? throw new InvalidOperationException("Authenticate or select a fleet boss first.");
             var token = await AccessTokenForSelectedBossAsync();
-            var response = await SendEsiAsync<CharacterFleetInfo>(HttpMethod.Get, $"/characters/{boss.CharacterId}/fleet/", token);
+            var response = await SendEsiAsync<CharacterFleetInfo>(HttpMethod.Get, $"/v1/characters/{boss.CharacterId}/fleet/", token);
 
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
@@ -644,11 +648,11 @@ internal sealed class TriffFleetsController
         }
     }
 
-    private async Task<FleetDryRunPlan> BuildPlanCoreAsync(FleetProfile profile, LiveFleetInfo liveFleet, string token, bool refreshCharacters)
+    private async Task<FleetDryRunPlan> BuildPlanCoreAsync(FleetProfile profile, LiveFleetInfo liveFleet, FleetAccessToken token, bool refreshCharacters)
     {
-        var wingsResponse = await SendEsiAsync<List<EsiWing>>(HttpMethod.Get, $"/fleets/{liveFleet.FleetId}/wings/", token);
+        var wingsResponse = await SendEsiAsync<List<EsiWing>>(HttpMethod.Get, $"/v1/fleets/{liveFleet.FleetId}/wings/", token);
         wingsResponse.ThrowIfFailed();
-        var membersResponse = await SendEsiAsync<List<EsiFleetMember>>(HttpMethod.Get, $"/fleets/{liveFleet.FleetId}/members/", token);
+        var membersResponse = await SendEsiAsync<List<EsiFleetMember>>(HttpMethod.Get, $"/v1/fleets/{liveFleet.FleetId}/members/", token);
         membersResponse.ThrowIfFailed();
 
         var liveWings = wingsResponse.Value ?? new List<EsiWing>();
@@ -805,7 +809,7 @@ internal sealed class TriffFleetsController
             {
                 await Task.Delay(StructureSettleBeforeMemberReadMs);
             }
-            var membersResponse = await SendEsiAsync<List<EsiFleetMember>>(HttpMethod.Get, $"/fleets/{liveFleet.FleetId}/members/", token);
+            var membersResponse = await SendEsiAsync<List<EsiFleetMember>>(HttpMethod.Get, $"/v1/fleets/{liveFleet.FleetId}/members/", token);
             membersResponse.ThrowIfFailed();
             var liveMembers = membersResponse.Value ?? new List<EsiFleetMember>();
             var memberById = liveMembers.ToDictionary(member => member.CharacterId);
@@ -861,7 +865,7 @@ internal sealed class TriffFleetsController
                 memberWrites.Add(async () =>
                 {
                     var invite = CreateInvitation(invitedCharacterId, invitedRole, invitedTarget.WingId, invitedTarget.SquadId);
-                    var inviteResponse = await SendEsiAsync<object>(HttpMethod.Post, $"/fleets/{liveFleet.FleetId}/members/", token, invite);
+                    var inviteResponse = await SendEsiAsync<object>(HttpMethod.Post, $"/v1/fleets/{liveFleet.FleetId}/members/", token, invite);
                     if (inviteResponse.IsSuccess)
                     {
                         AddResult(results, FleetApplyResult.Member(invitedName, invitedCharacterId, "invited", $"{invitedPlacement.WingName} / {invitedPlacement.SquadName}"), memberResultLock);
@@ -930,9 +934,9 @@ internal sealed class TriffFleetsController
         }
     }
 
-    private async Task<FleetStructureResult> EnsureStructureAsync(FleetProfile profile, LiveFleetInfo liveFleet, string token, List<FleetApplyResult> results)
+    private async Task<FleetStructureResult> EnsureStructureAsync(FleetProfile profile, LiveFleetInfo liveFleet, FleetAccessToken token, List<FleetApplyResult> results)
     {
-        var wingsResponse = await SendEsiAsync<List<EsiWing>>(HttpMethod.Get, $"/fleets/{liveFleet.FleetId}/wings/", token);
+        var wingsResponse = await SendEsiAsync<List<EsiWing>>(HttpMethod.Get, $"/v1/fleets/{liveFleet.FleetId}/wings/", token);
         wingsResponse.ThrowIfFailed();
         var liveWings = wingsResponse.Value ?? new List<EsiWing>();
         var liveLayout = LiveLayoutFor(liveFleet.FleetId, profile.Id);
@@ -972,7 +976,7 @@ internal sealed class TriffFleetsController
             }
             else
             {
-                var create = await SendEsiAsync<CreateWingResponse>(HttpMethod.Post, $"/fleets/{liveFleet.FleetId}/wings/", token);
+                var create = await SendEsiAsync<CreateWingResponse>(HttpMethod.Post, $"/v1/fleets/{liveFleet.FleetId}/wings/", token);
                 create.ThrowIfFailed();
                 liveWing = new EsiWing { Id = create.Value?.WingId ?? 0, Name = "", Squads = new List<EsiSquad>() };
                 liveWings.Add(liveWing);
@@ -987,7 +991,7 @@ internal sealed class TriffFleetsController
 
             if (createdWing || !string.Equals(liveWing.Name, desiredWingName, StringComparison.Ordinal))
             {
-                var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{liveFleet.FleetId}/wings/{liveWing.Id}/", token, new { name = desiredWingName });
+                var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{liveFleet.FleetId}/wings/{liveWing.Id}/", token, new { name = desiredWingName });
                 rename.ThrowIfFailed();
                 results.Add(new FleetApplyResult("wing", desiredWingName, liveWing.Id, "renamed", createdWing ? "Named after creation." : $"Renamed from {liveWing.Name}."));
                 liveWing.Name = desiredWingName;
@@ -1023,7 +1027,7 @@ internal sealed class TriffFleetsController
 
                 if (liveSquad == null)
                 {
-                    var create = await SendEsiAsync<CreateSquadResponse>(HttpMethod.Post, $"/fleets/{liveFleet.FleetId}/wings/{liveWing.Id}/squads/", token);
+                    var create = await SendEsiAsync<CreateSquadResponse>(HttpMethod.Post, $"/v1/fleets/{liveFleet.FleetId}/wings/{liveWing.Id}/squads/", token);
                     create.ThrowIfFailed();
                     liveSquad = new EsiSquad { Id = create.Value?.SquadId ?? 0, Name = "" };
                     liveWing.Squads.Add(liveSquad);
@@ -1039,7 +1043,7 @@ internal sealed class TriffFleetsController
 
                 if (createdSquad || !string.Equals(liveSquad.Name, desiredSquadName, StringComparison.Ordinal))
                 {
-                    var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{liveFleet.FleetId}/squads/{liveSquad.Id}/", token, new { name = desiredSquadName });
+                    var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{liveFleet.FleetId}/squads/{liveSquad.Id}/", token, new { name = desiredSquadName });
                     rename.ThrowIfFailed();
                     results.Add(new FleetApplyResult("squad", desiredSquadName, liveSquad.Id, "renamed", createdSquad ? "Named after creation." : $"Renamed from {liveSquad.Name}."));
                     liveSquad.Name = desiredSquadName;
@@ -1061,7 +1065,7 @@ internal sealed class TriffFleetsController
         return new FleetStructureResult(map, liveWings, mutated);
     }
 
-    private async Task<bool> MoveExistingMemberIfNeededAsync(long fleetId, EsiFleetMember member, string name, string role, LivePlacementTarget target, string token, List<FleetApplyResult> results, object? resultLock = null)
+    private async Task<bool> MoveExistingMemberIfNeededAsync(long fleetId, EsiFleetMember member, string name, string role, LivePlacementTarget target, FleetAccessToken token, List<FleetApplyResult> results, object? resultLock = null)
     {
         if (MemberMatchesTarget(member, role, target))
         {
@@ -1070,7 +1074,7 @@ internal sealed class TriffFleetsController
         }
 
         var move = CreateMovement(role, target.WingId, target.SquadId);
-        var response = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{fleetId}/members/{member.CharacterId}/", token, move);
+        var response = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{fleetId}/members/{member.CharacterId}/", token, move);
         var moved = false;
         if (response.IsSuccess)
         {
@@ -1089,19 +1093,19 @@ internal sealed class TriffFleetsController
         return moved;
     }
 
-    private async Task<LivePlacementTarget> EnsureBenchAsync(LiveFleetInfo liveFleet, string token, List<EsiWing> liveWings, List<FleetApplyResult> results)
+    private async Task<LivePlacementTarget> EnsureBenchAsync(LiveFleetInfo liveFleet, FleetAccessToken token, List<EsiWing> liveWings, List<FleetApplyResult> results)
     {
         var benchWing = liveWings.FirstOrDefault(wing => string.Equals(wing.Name, BenchWingName, StringComparison.OrdinalIgnoreCase));
         if (benchWing == null)
         {
-            var create = await SendEsiAsync<CreateWingResponse>(HttpMethod.Post, $"/fleets/{liveFleet.FleetId}/wings/", token);
+            var create = await SendEsiAsync<CreateWingResponse>(HttpMethod.Post, $"/v1/fleets/{liveFleet.FleetId}/wings/", token);
             create.ThrowIfFailed();
             benchWing = new EsiWing { Id = create.Value?.WingId ?? 0, Name = BenchWingName, Squads = new List<EsiSquad>() };
             liveWings.Add(benchWing);
             results.Add(new FleetApplyResult("wing", BenchWingName, benchWing.Id, "created", "Bench wing created for unassigned existing members."));
             await Task.Delay(WriteThrottleMs);
 
-            var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{liveFleet.FleetId}/wings/{benchWing.Id}/", token, new { name = BenchWingName });
+            var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{liveFleet.FleetId}/wings/{benchWing.Id}/", token, new { name = BenchWingName });
             rename.ThrowIfFailed();
             await Task.Delay(WriteThrottleMs);
         }
@@ -1109,14 +1113,14 @@ internal sealed class TriffFleetsController
         var waitingSquad = benchWing.Squads.FirstOrDefault(squad => string.Equals(squad.Name, BenchSquadName, StringComparison.OrdinalIgnoreCase));
         if (waitingSquad == null)
         {
-            var create = await SendEsiAsync<CreateSquadResponse>(HttpMethod.Post, $"/fleets/{liveFleet.FleetId}/wings/{benchWing.Id}/squads/", token);
+            var create = await SendEsiAsync<CreateSquadResponse>(HttpMethod.Post, $"/v1/fleets/{liveFleet.FleetId}/wings/{benchWing.Id}/squads/", token);
             create.ThrowIfFailed();
             waitingSquad = new EsiSquad { Id = create.Value?.SquadId ?? 0, Name = BenchSquadName };
             benchWing.Squads.Add(waitingSquad);
             results.Add(new FleetApplyResult("squad", BenchSquadName, waitingSquad.Id, "created", "Bench waiting squad created for unassigned existing members."));
             await Task.Delay(WriteThrottleMs);
 
-            var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{liveFleet.FleetId}/squads/{waitingSquad.Id}/", token, new { name = BenchSquadName });
+            var rename = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{liveFleet.FleetId}/squads/{waitingSquad.Id}/", token, new { name = BenchSquadName });
             rename.ThrowIfFailed();
             await Task.Delay(WriteThrottleMs);
         }
@@ -1124,7 +1128,7 @@ internal sealed class TriffFleetsController
         return new LivePlacementTarget(benchWing.Id, waitingSquad.Id);
     }
 
-    private async Task<bool> MoveUnexpectedMembersToBenchAsync(LiveFleetInfo liveFleet, string token, List<EsiFleetMember> liveMembers, HashSet<long> expectedCharacterIds, LivePlacementTarget benchTarget, List<FleetApplyResult> results)
+    private async Task<bool> MoveUnexpectedMembersToBenchAsync(LiveFleetInfo liveFleet, FleetAccessToken token, List<EsiFleetMember> liveMembers, HashSet<long> expectedCharacterIds, LivePlacementTarget benchTarget, List<FleetApplyResult> results)
     {
         var memberWrites = new List<Func<Task<bool>>>();
         var resultLock = new object();
@@ -1148,7 +1152,7 @@ internal sealed class TriffFleetsController
             memberWrites.Add(async () =>
             {
                 var move = CreateMovement("squad_member", benchTarget.WingId, benchTarget.SquadId);
-                var response = await SendEsiAsync<object>(HttpMethod.Put, $"/fleets/{liveFleet.FleetId}/members/{capturedMember.CharacterId}/", token, move);
+                var response = await SendEsiAsync<object>(HttpMethod.Put, $"/v1/fleets/{liveFleet.FleetId}/members/{capturedMember.CharacterId}/", token, move);
                 var moved = false;
                 if (response.IsSuccess)
                 {
@@ -1173,7 +1177,7 @@ internal sealed class TriffFleetsController
         return moveResults.Any(moved => moved);
     }
 
-    private async Task PruneExtraStructureAsync(LiveFleetInfo liveFleet, string token, List<EsiWing> liveWings, List<EsiFleetMember> liveMembers, HashSet<long> protectedWingIds, HashSet<long> protectedSquadIds, List<FleetApplyResult> results)
+    private async Task PruneExtraStructureAsync(LiveFleetInfo liveFleet, FleetAccessToken token, List<EsiWing> liveWings, List<EsiFleetMember> liveMembers, HashSet<long> protectedWingIds, HashSet<long> protectedSquadIds, List<FleetApplyResult> results)
     {
         var occupiedWingIds = liveMembers.Where(member => member.WingId > 0).Select(member => member.WingId).ToHashSet();
         var occupiedSquadIds = liveMembers.Where(member => member.SquadId > 0).Select(member => member.SquadId).ToHashSet();
@@ -1236,7 +1240,7 @@ internal sealed class TriffFleetsController
 
         await RunCleanupBatchAsync(wingsToDelete, async wing =>
         {
-            var deleteWing = await SendEsiAsync<object>(HttpMethod.Delete, $"/fleets/{liveFleet.FleetId}/wings/{wing.Id}/", token);
+            var deleteWing = await SendEsiAsync<object>(HttpMethod.Delete, $"/v1/fleets/{liveFleet.FleetId}/wings/{wing.Id}/", token);
             if (deleteWing.IsSuccess)
             {
                 lock (resultLock)
@@ -1299,9 +1303,9 @@ internal sealed class TriffFleetsController
         await Task.WhenAll(tasks);
     }
 
-    private async Task<bool> DeleteSquadAsync(long fleetId, EsiSquad squad, string token, List<FleetApplyResult> results, object? resultLock = null)
+    private async Task<bool> DeleteSquadAsync(long fleetId, EsiSquad squad, FleetAccessToken token, List<FleetApplyResult> results, object? resultLock = null)
     {
-        var deleteSquad = await SendEsiAsync<object>(HttpMethod.Delete, $"/fleets/{fleetId}/squads/{squad.Id}/", token);
+        var deleteSquad = await SendEsiAsync<object>(HttpMethod.Delete, $"/v1/fleets/{fleetId}/squads/{squad.Id}/", token);
         if (deleteSquad.IsSuccess)
         {
             AddResult(results, new FleetApplyResult("squad", squad.Name, squad.Id, "deleted", "Extra empty squad deleted."), resultLock);
@@ -1483,7 +1487,7 @@ internal sealed class TriffFleetsController
 
         if (missing.Count > 0)
         {
-            var response = await SendEsiAsync<UniverseIdsResponse>(HttpMethod.Post, "/universe/ids/", token: null, body: missing);
+            var response = await SendEsiAsync<UniverseIdsResponse>(HttpMethod.Post, "/v3/universe/ids/", token: null, body: missing);
             response.ThrowIfFailed();
             foreach (var character in response.Value?.Characters ?? new List<UniverseIdName>())
             {
@@ -1502,117 +1506,26 @@ internal sealed class TriffFleetsController
         return result;
     }
 
-    private async Task<EsiResponse<T>> SendEsiAsync<T>(HttpMethod method, string path, string? token, object? body = null)
+    private async Task<EsiResponse<T>> SendEsiAsync<T>(HttpMethod method, string path, FleetAccessToken? token, object? body = null)
     {
-        var url = path.StartsWith("http", StringComparison.OrdinalIgnoreCase) ? path : $"{EsiBaseUrl}{path}";
-        var bodyJson = body == null ? null : JsonSerializer.Serialize(body, JsonOptions);
-        Exception? lastException = null;
-
-        for (var attempt = 1; attempt <= EsiTransientMaxAttempts; attempt++)
+        var accessToken = token?.AccessToken;
+        if (token is not null
+            && _accessTokens.TryGetValue(token.CharacterId, out var current)
+            && current.ExpiresUtc > DateTimeOffset.UtcNow.AddSeconds(30))
         {
-            try
-            {
-                using var request = new HttpRequestMessage(method, url);
-                request.Headers.UserAgent.ParseAdd("TriffView/1.0 TriffFleets");
-                request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
-                if (!string.IsNullOrWhiteSpace(token))
-                {
-                    request.Headers.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                }
-                if (bodyJson != null)
-                {
-                    request.Content = new StringContent(bodyJson, Encoding.UTF8, "application/json");
-                }
-
-                using var response = await Http.SendAsync(request);
-                var text = await response.Content.ReadAsStringAsync();
-                var error = response.IsSuccessStatusCode ? "" : ReadError(text);
-                var esiRemain = HeaderValue(response, "X-Esi-Error-Limit-Remain");
-                var esiReset = HeaderValue(response, "X-Esi-Error-Limit-Reset");
-                var retryAfter = HeaderValue(response, "Retry-After");
-                if (!string.IsNullOrWhiteSpace(esiRemain) || !string.IsNullOrWhiteSpace(esiReset) || !string.IsNullOrWhiteSpace(retryAfter))
-                {
-                    error = $"{error} ESI error limit remain={esiRemain}, reset={esiReset}, retry-after={retryAfter}".Trim();
-                }
-
-                if (!response.IsSuccessStatusCode && ShouldRetryEsi(method, path, response.StatusCode, attempt))
-                {
-                    await Task.Delay(RetryDelay(attempt, retryAfter));
-                    continue;
-                }
-
-                T? value = default;
-                if (response.IsSuccessStatusCode && !string.IsNullOrWhiteSpace(text) && typeof(T) != typeof(object))
-                {
-                    value = JsonSerializer.Deserialize<T>(text, JsonOptions);
-                }
-
-                return new EsiResponse<T>(response.StatusCode, value, error, method.Method, path);
-            }
-            catch (Exception ex) when (IsTransientNetworkException(ex) && attempt < EsiTransientMaxAttempts)
-            {
-                lastException = ex;
-                await Task.Delay(RetryDelay(attempt, ""));
-            }
-            catch (Exception ex) when (IsTransientNetworkException(ex))
-            {
-                lastException = ex;
-                break;
-            }
+            accessToken = current.AccessToken;
         }
 
-        return new EsiResponse<T>(
-            HttpStatusCode.ServiceUnavailable,
-            default,
-            lastException?.Message ?? "ESI request failed after transient retries.",
-            method.Method,
-            path
-        );
-    }
-
-    private static bool ShouldRetryEsi(HttpMethod method, string path, HttpStatusCode statusCode, int attempt)
-    {
-        if (attempt >= EsiTransientMaxAttempts) return false;
-
-        var status = (int)statusCode;
-        var transient = status is 408 or 420 or 429 or 500 or 502 or 503 or 504;
-        if (!transient) return false;
-
-        if (method == HttpMethod.Get || method == HttpMethod.Put) return true;
-        return method == HttpMethod.Post && path.StartsWith("/universe/ids/", StringComparison.OrdinalIgnoreCase);
-    }
-
-    private static TimeSpan RetryDelay(int attempt, string retryAfter)
-    {
-        if (int.TryParse(retryAfter, out var seconds) && seconds > 0)
-        {
-            return TimeSpan.FromSeconds(Math.Min(seconds, 8));
-        }
-
-        return TimeSpan.FromMilliseconds(EsiTransientBaseDelayMs * attempt);
-    }
-
-    private static bool IsTransientNetworkException(Exception ex)
-    {
-        return ex is HttpRequestException or TaskCanceledException or SocketException;
-    }
-
-    private static string HeaderValue(HttpResponseMessage response, string name)
-    {
-        return response.Headers.TryGetValues(name, out var values) ? string.Join(",", values) : "";
-    }
-
-    private static string ReadError(string text)
-    {
-        if (string.IsNullOrWhiteSpace(text)) return "No response body.";
+        var response = await _esi.SendAsync<T>(method, path, accessToken, body, _lifetime.Token);
+        if (token is null || response.StatusCode != HttpStatusCode.Unauthorized) return response;
         try
         {
-            var node = JsonNode.Parse(text)?.AsObject();
-            return node?["error"]?.GetValue<string>() ?? text;
+            var refreshed = await AccessTokenForBossAsync(token.CharacterId, forceRefresh: true, rejectedAccessToken: accessToken);
+            return await _esi.SendAsync<T>(method, path, refreshed.AccessToken, body, _lifetime.Token);
         }
-        catch
+        catch (OAuthTokenException exception) when (exception.IsDefinitiveAuthorizationFailure)
         {
-            return text;
+            return new EsiResponse<T>(HttpStatusCode.Unauthorized, default, "Fleet boss authorization is no longer valid; authenticate again.", method.Method, path);
         }
     }
 
@@ -1658,13 +1571,14 @@ internal sealed class TriffFleetsController
                     boss.CharacterName,
                     boss.Scopes,
                     boss.AuthenticatedUtc,
-                    tokenStored = !string.IsNullOrWhiteSpace(CredentialStore.Read(RefreshTokenTarget(boss.CharacterId))),
+                    tokenStored = !string.IsNullOrWhiteSpace(_credentials.Read(RefreshTokenTarget(boss.CharacterId))),
                 }).ToArray(),
                 liveFleet = _liveFleet,
                 selectedProfileId = selectedProfile?.Id ?? "",
                 profiles = _state.Profiles,
                 dryRun = _lastPlan,
                 applyResult = _lastApply,
+                startupWarning = _startupWarning,
                 complianceNote = "Uses ESI only. Does not control EVE clients. Characters accept invites manually in-game.",
             };
             var json = JsonSerializer.Serialize(state, JsonOptions);
@@ -1695,79 +1609,21 @@ internal sealed class TriffFleetsController
             : "squad_member";
     }
 
-    private static string RefreshTokenTarget(long characterId) => $"TriffView.TriffFleets.RefreshToken.{characterId}";
-
-    private static string Base64Url(byte[] bytes)
-    {
-        return Convert.ToBase64String(bytes).TrimEnd('=').Replace('+', '-').Replace('/', '_');
-    }
-
-    private static byte[] DecodeBase64Url(string value)
-    {
-        var padded = value.Replace('-', '+').Replace('_', '/');
-        padded += new string('=', (4 - padded.Length % 4) % 4);
-        return Convert.FromBase64String(padded);
-    }
-
-    private static EveJwtIdentity DecodeEveJwt(string token)
-    {
-        var parts = token.Split('.');
-        if (parts.Length < 2) throw new InvalidDataException("EVE SSO returned an invalid access token.");
-        var payload = Encoding.UTF8.GetString(DecodeBase64Url(parts[1]));
-        var node = JsonNode.Parse(payload)?.AsObject() ?? throw new InvalidDataException("EVE SSO access token payload could not be read.");
-        var characterId = 0L;
-
-        foreach (var key in new[] { "character_id", "CharacterID", "characterID", "characterId" })
-        {
-            if (node[key] == null) continue;
-            try
-            {
-                characterId = node[key]!.GetValue<long>();
-                if (characterId > 0) break;
-            }
-            catch
-            {
-                var value = node[key]?.GetValue<string>() ?? "";
-                long.TryParse(value, out characterId);
-                if (characterId > 0) break;
-            }
-        }
-
-        if (characterId <= 0)
-        {
-            var sub = node["sub"]?.GetValue<string>() ?? "";
-            var numericTail = sub.Split(':', '/', '|').LastOrDefault(part => long.TryParse(part, out _)) ?? "";
-            long.TryParse(numericTail, out characterId);
-        }
-
-        if (characterId <= 0)
-        {
-            throw new InvalidDataException("The EVE SSO token did not include a usable character ID.");
-        }
-
-        var name = node["name"]?.GetValue<string>() ?? $"Character {characterId}";
-        var scopes = new List<string>();
-        if (node["scp"] is JsonArray array)
-        {
-            scopes.AddRange(array.Select(scope => scope?.GetValue<string>() ?? "").Where(scope => !string.IsNullOrWhiteSpace(scope)));
-        }
-        else if (node["scp"] != null)
-        {
-            scopes.AddRange((node["scp"]?.GetValue<string>() ?? "").Split(' ', StringSplitOptions.RemoveEmptyEntries));
-        }
-
-        return new EveJwtIdentity(characterId, name, scopes);
-    }
+    private static string RefreshTokenTarget(long characterId) => CredentialPrefix + characterId;
 }
 
 internal sealed class TriffFleetsLocalState
 {
+    private const long MaxSettingsFileBytes = 8 * 1024 * 1024;
     public long SelectedBossCharacterId { get; set; }
     public string SelectedProfileId { get; set; } = "";
     public List<FleetBossAuth> Bosses { get; set; } = new();
     public List<FleetProfile> Profiles { get; set; } = new();
     public Dictionary<string, CachedCharacter> CharacterCache { get; set; } = new(StringComparer.OrdinalIgnoreCase);
     public List<LiveFleetLayoutMap> LiveLayouts { get; set; } = new();
+
+    [JsonIgnore]
+    public string LoadWarning { get; set; } = "";
 
     private static string SettingsPath => Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
@@ -1777,25 +1633,62 @@ internal sealed class TriffFleetsLocalState
 
     public static TriffFleetsLocalState Load()
     {
+        if (!File.Exists(SettingsPath)) return new TriffFleetsLocalState().Normalize();
         try
         {
-            if (!File.Exists(SettingsPath)) return new TriffFleetsLocalState().Normalize();
-            var state = JsonSerializer.Deserialize<TriffFleetsLocalState>(File.ReadAllText(SettingsPath), TriffFleetsControllerJson.Options);
-            return (state ?? new TriffFleetsLocalState()).Normalize();
+            var state = JsonSerializer.Deserialize<TriffFleetsLocalState>(AtomicFile.ReadBoundedText(SettingsPath, MaxSettingsFileBytes), TriffFleetsControllerJson.Options);
+            return (state ?? throw new InvalidDataException("Fleet settings were empty.")).Normalize();
         }
-        catch
+        catch (Exception primary) when (primary is JsonException or InvalidDataException or DecoderFallbackException)
         {
-            return new TriffFleetsLocalState().Normalize();
+            var empty = new TriffFleetsLocalState().Normalize();
+            string preserved;
+            try
+            {
+                preserved = AtomicFile.PreserveCorrupt(SettingsPath);
+            }
+            catch (Exception preserve) when (IsFileFailure(preserve))
+            {
+                empty.LoadWarning = $"Fleet settings could not be read or preserved: {preserve.Message}";
+                return empty;
+            }
+            var backup = SettingsPath + ".bak";
+            if (!File.Exists(backup))
+            {
+                empty.LoadWarning = $"Fleet settings were corrupt and preserved at {preserved}; no backup was available.";
+                return empty;
+            }
+            try
+            {
+                var recovered = JsonSerializer.Deserialize<TriffFleetsLocalState>(AtomicFile.ReadBoundedText(backup, MaxSettingsFileBytes), TriffFleetsControllerJson.Options)
+                    ?? throw new InvalidDataException("Fleet settings backup was empty.");
+                AtomicFile.WriteText(SettingsPath, JsonSerializer.Serialize(recovered, TriffFleetsControllerJson.Options), keepBackup: false);
+                recovered.Normalize();
+                recovered.LoadWarning = $"Recovered corrupt Fleet settings from the last-known-good backup. Corrupt file: {preserved}";
+                return recovered;
+            }
+            catch (Exception backupError) when (backupError is JsonException or InvalidDataException or DecoderFallbackException || IsFileFailure(backupError))
+            {
+                empty.LoadWarning = $"Fleet settings and backup were unreadable. Corrupt file: {preserved}. Backup: {backupError.Message}";
+                return empty;
+            }
+        }
+        catch (Exception exception) when (IsFileFailure(exception))
+        {
+            var state = new TriffFleetsLocalState().Normalize();
+            state.LoadWarning = $"Fleet settings could not be read; the original file was left in place. {exception.Message}";
+            return state;
         }
     }
 
     public void Save()
     {
         Normalize();
-        var directory = Path.GetDirectoryName(SettingsPath);
-        if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
-        File.WriteAllText(SettingsPath, JsonSerializer.Serialize(this, TriffFleetsControllerJson.Options), new UTF8Encoding(false));
+        AtomicFile.WriteText(SettingsPath, JsonSerializer.Serialize(this, TriffFleetsControllerJson.Options));
     }
+
+    private static bool IsFileFailure(Exception exception)
+        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
 
     public TriffFleetsLocalState Normalize()
     {
@@ -1843,8 +1736,27 @@ internal sealed class FleetBossAuth
 {
     public long CharacterId { get; set; }
     public string CharacterName { get; set; } = "";
+    public string OwnerHash { get; set; } = "";
     public List<string> Scopes { get; set; } = new();
     public DateTimeOffset AuthenticatedUtc { get; set; }
+
+    public FleetBossAuth Clone() => new()
+    {
+        CharacterId = CharacterId,
+        CharacterName = CharacterName,
+        OwnerHash = OwnerHash,
+        Scopes = Scopes.ToList(),
+        AuthenticatedUtc = AuthenticatedUtc,
+    };
+
+    public void CopyFrom(FleetBossAuth other)
+    {
+        CharacterId = other.CharacterId;
+        CharacterName = other.CharacterName;
+        OwnerHash = other.OwnerHash;
+        Scopes = other.Scopes.ToList();
+        AuthenticatedUtc = other.AuthenticatedUtc;
+    }
 }
 
 internal sealed class CachedCharacter
@@ -2021,23 +1933,7 @@ internal sealed record ProfileValidation(List<string> Errors, List<string> Warni
     public ProfileValidation() : this(new List<string>(), new List<string>()) { }
 }
 internal sealed record AccessTokenCache(string AccessToken, DateTimeOffset ExpiresUtc);
-internal sealed record EveJwtIdentity(long CharacterId, string CharacterName, List<string> Scopes);
-
-internal sealed class TokenResponse
-{
-    [JsonPropertyName("access_token")]
-    public string AccessToken { get; set; } = "";
-
-    [JsonPropertyName("refresh_token")]
-    public string RefreshToken { get; set; } = "";
-
-    [JsonPropertyName("expires_in")]
-    public int ExpiresIn { get; set; }
-
-    [JsonPropertyName("token_type")]
-    public string TokenType { get; set; } = "";
-}
-
+internal sealed record FleetAccessToken(long CharacterId, string AccessToken);
 internal sealed class CharacterFleetInfo
 {
     [JsonPropertyName("fleet_boss_id")]
@@ -2117,106 +2013,4 @@ internal sealed class UniverseIdName
 
     [JsonPropertyName("name")]
     public string Name { get; set; } = "";
-}
-
-internal sealed record EsiResponse<T>(HttpStatusCode StatusCode, T? Value, string Error, string Method, string Path)
-{
-    public bool IsSuccess => (int)StatusCode is >= 200 and <= 299;
-
-    public void ThrowIfFailed()
-    {
-        if (!IsSuccess)
-        {
-            throw new InvalidOperationException($"{Method} {Path} returned {(int)StatusCode}: {Error}");
-        }
-    }
-}
-
-internal static class CredentialStore
-{
-    private const uint CredTypeGeneric = 1;
-    private const uint CredPersistLocalMachine = 2;
-
-    public static void Write(string target, string secret)
-    {
-        var bytes = Encoding.Unicode.GetBytes(secret);
-        var blob = Marshal.AllocCoTaskMem(bytes.Length);
-        try
-        {
-            Marshal.Copy(bytes, 0, blob, bytes.Length);
-            var credential = new NativeCredential
-            {
-                Type = CredTypeGeneric,
-                TargetName = target,
-                CredentialBlobSize = (uint)bytes.Length,
-                CredentialBlob = blob,
-                Persist = CredPersistLocalMachine,
-                UserName = "TriffView",
-            };
-
-            if (!CredWrite(ref credential, 0))
-            {
-                throw new InvalidOperationException($"Windows Credential Manager write failed: {Marshal.GetLastWin32Error()}");
-            }
-        }
-        finally
-        {
-            Marshal.FreeCoTaskMem(blob);
-        }
-    }
-
-    public static string Read(string target)
-    {
-        if (!CredRead(target, CredTypeGeneric, 0, out var credentialPtr) || credentialPtr == IntPtr.Zero)
-        {
-            return "";
-        }
-
-        try
-        {
-            var credential = Marshal.PtrToStructure<NativeCredential>(credentialPtr);
-            if (credential.CredentialBlob == IntPtr.Zero || credential.CredentialBlobSize == 0) return "";
-            var bytes = new byte[credential.CredentialBlobSize];
-            Marshal.Copy(credential.CredentialBlob, bytes, 0, bytes.Length);
-            return Encoding.Unicode.GetString(bytes).TrimEnd('\0');
-        }
-        finally
-        {
-            CredFree(credentialPtr);
-        }
-    }
-
-    public static void Delete(string target)
-    {
-        CredDelete(target, CredTypeGeneric, 0);
-    }
-
-    [DllImport("advapi32.dll", EntryPoint = "CredWriteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredWrite(ref NativeCredential userCredential, uint flags);
-
-    [DllImport("advapi32.dll", EntryPoint = "CredReadW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredRead(string target, uint type, uint reservedFlag, out IntPtr credentialPtr);
-
-    [DllImport("advapi32.dll", EntryPoint = "CredDeleteW", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern bool CredDelete(string target, uint type, uint flags);
-
-    [DllImport("advapi32.dll", SetLastError = true)]
-    private static extern void CredFree(IntPtr buffer);
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct NativeCredential
-    {
-        public uint Flags;
-        public uint Type;
-        public string TargetName;
-        public string? Comment;
-        public FILETIME LastWritten;
-        public uint CredentialBlobSize;
-        public IntPtr CredentialBlob;
-        public uint Persist;
-        public uint AttributeCount;
-        public IntPtr Attributes;
-        public string? TargetAlias;
-        public string? UserName;
-    }
 }

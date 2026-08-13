@@ -1,3 +1,4 @@
+using System.Text.Json;
 using TriffView.TriffSkills;
 using Xunit;
 
@@ -6,78 +7,38 @@ namespace TriffView.Tests;
 public class SkillIdCacheTests
 {
     [Fact]
-    public void FromJsonPreservesCaseInsensitiveLookup()
+    public void VersionedCacheLoadsOnlyValidatedPositiveTypeAndGroupIds()
     {
-        // System.Text.Json deserializes into a default-comparer dictionary; FromJson
-        // must copy entries into a case-insensitive map or hand-written plan casing
-        // ("caldari frigate") stops resolving after a restart.
-        var cache = SkillIdCache.FromJson("""{"Caldari Frigate": 123, " Padded ": 456}""");
-
-        Assert.Equal(123, cache.Map["caldari frigate"]);
-        Assert.Equal(456, cache.Map["padded"]); // keys are trimmed on load
+        var cache = SkillIdCache.FromJson("""{"version":3,"skills":{"Caldari Frigate":{"typeId":123,"groupId":45,"categoryId":16},"Bad":{"typeId":0,"groupId":2,"categoryId":16},"Wrong category":{"typeId":8,"groupId":2,"categoryId":6}," Padded ":{"typeId":9,"groupId":3,"categoryId":16}}}""");
+        Assert.Equal(123, cache.Map["caldari frigate"].TypeId);
+        Assert.Equal(9, cache.Map["padded"].TypeId);
+        Assert.False(cache.Map.ContainsKey("Bad"));
+        Assert.False(cache.Map.ContainsKey("Wrong category"));
     }
 
     [Fact]
-    public void FromJsonDropsInvalidEntries()
+    public void LegacyArbitraryIdMapIsNotAcceptedAsValidatedData()
     {
-        var cache = SkillIdCache.FromJson("""{"": 1, "  ": 2, "Zeroed": 0, "Negative": -5, "Good": 9}""");
-        Assert.Single(cache.Map);
-        Assert.Equal(9, cache.Map["Good"]);
+        Assert.Throws<JsonException>(() => SkillIdCache.FromJson("""{"Navigation":123}"""));
     }
 
     [Fact]
-    public void UnresolvedDedupesCaseInsensitivelyAndSkipsCached()
+    public void UnresolvedDeduplicatesAndMergeNeverOverwritesFirstValidation()
     {
-        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { ["Known"] = 1 };
-        var missing = SkillIdCache.Unresolved(map, new[] { "known", "New Skill", "new skill", " New Skill ", "", "  " });
-        Assert.Equal(new[] { "New Skill" }, missing);
+        var cache = new SkillIdCache();
+        Assert.Equal(1, cache.Merge([("Known", new ValidatedSkillType(1, 2))]));
+        Assert.Equal(new[] { "New" }, cache.Unresolved(["known", "New", " new ", ""]));
+        Assert.Equal(1, cache.Merge([
+            ("Known", new ValidatedSkillType(8, 9)),
+            ("New", new ValidatedSkillType(3, 4)),
+            ("Bad", new ValidatedSkillType(0, 4))]));
+        Assert.Equal(1, cache.Map["Known"].TypeId);
     }
 
     [Fact]
-    public void MergeAddsOnlyValidNewEntries()
+    public void BatchUsesTheBoundedEsiSize()
     {
-        var map = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase) { ["Existing"] = 1 };
-        var added = SkillIdCache.Merge(map, new[]
-        {
-            new SkillsUniverseIdName { Id = 2, Name = "Existing" },   // already present
-            new SkillsUniverseIdName { Id = 3, Name = "Fresh" },
-            new SkillsUniverseIdName { Id = 0, Name = "Zero Id" },
-            new SkillsUniverseIdName { Id = 4, Name = "  " },
-        });
-
-        Assert.Equal(1, added);
-        Assert.Equal(1, map["Existing"]); // first resolution wins
-        Assert.Equal(3, map["Fresh"]);
-    }
-
-    [Fact]
-    public void BatchSplitsAtTheRequestedSize()
-    {
-        var names = Enumerable.Range(0, 1201).Select(i => $"skill-{i}").ToList();
-        var batches = SkillIdCache.Batch(names, 500);
-        Assert.Equal(3, batches.Count);
-        Assert.Equal(500, batches[0].Count);
-        Assert.Equal(500, batches[1].Count);
-        Assert.Equal(201, batches[2].Count);
-    }
-
-    [Fact]
-    public async Task ResolveMissingAsyncSendsOnlyUncachedNames()
-    {
-        var cache = SkillIdCache.FromJson("""{"Cached": 1}""");
-        var requested = new List<string>();
-        var added = await cache.ResolveMissingAsync(
-            new[] { "Cached", "New One" },
-            batch =>
-            {
-                requested.AddRange(batch);
-                return Task.FromResult<IReadOnlyList<SkillsUniverseIdName>>(
-                    new[] { new SkillsUniverseIdName { Id = 7, Name = "New One" } });
-            },
-            persist: false);
-
-        Assert.Equal(1, added);
-        Assert.Equal(new[] { "New One" }, requested);
-        Assert.Equal(7, cache.Map["new one"]);
+        var batches = SkillIdCache.Batch(Enumerable.Range(0, 1201).Select(index => $"skill-{index}"));
+        Assert.Equal([500, 500, 201], batches.Select(batch => batch.Count).ToArray());
     }
 }

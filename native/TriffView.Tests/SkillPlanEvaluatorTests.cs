@@ -7,110 +7,83 @@ public class SkillPlanEvaluatorTests
 {
     private static readonly DateTimeOffset Soon = new(2026, 8, 1, 12, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset Later = new(2026, 9, 1, 12, 0, 0, TimeSpan.Zero);
-
-    private static SkillPlan Plan(params (string Name, int Level)[] requirements)
-        => new("p", requirements.Select(r => new PlanRequirement(r.Name, r.Level)).ToList());
-
-    private static ILookup<int, QueueEntry> Queue(params QueueEntry[] entries)
-        => entries.ToLookup(entry => entry.SkillId);
-
-    private static readonly Dictionary<string, int> Ids = new(StringComparer.OrdinalIgnoreCase)
-    {
-        ["Navigation"] = 100,
-        ["Gunnery"] = 200,
-    };
+    private static readonly Dictionary<string, int> Ids = new(StringComparer.OrdinalIgnoreCase) { ["Navigation"] = 100, ["Gunnery"] = 200 };
+    private static SkillPlan Plan(params (string Name, int Level)[] values) => new("p", values.Select(value => new PlanRequirement(value.Name, value.Level)).ToArray());
+    private static ILookup<int, QueueEntry> Queue(params QueueEntry[] entries) => entries.ToLookup(entry => entry.SkillId);
 
     [Fact]
-    public void ReadyWhenEveryRequirementIsTrained()
+    public void ReadyRequiresEveryRequirementAtItsActiveLevel()
     {
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Navigation", 4), ("Gunnery", 3)),
-            Ids,
-            new Dictionary<int, int> { [100] = 5, [200] = 3 },
-            Queue());
-
-        Assert.Equal(PlanReadiness.Ready, analysis.Readiness);
-        Assert.Null(analysis.EstimatedFinishUtc);
+        var ready = Evaluate(Plan(("Navigation", 4)), active: Levels((100, 4)), trained: Levels((100, 5)));
+        var inactive = Evaluate(Plan(("Navigation", 4)), active: Levels((100, 3)), trained: Levels((100, 5)));
+        Assert.Equal(PlanReadiness.Ready, ready.Readiness);
+        Assert.Equal(PlanReadiness.Locked, inactive.Readiness);
+        Assert.Equal(RequirementState.TrainedInactive, Assert.Single(inactive.Requirements).State);
     }
 
     [Fact]
-    public void TrainingWhenRemainderIsQueued_EtaIsTheLatestRelevantEntry()
+    public void TrainingUsesSmallestSufficientQueueEntryAndLatestPlanEta()
     {
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Navigation", 4), ("Gunnery", 3)),
-            Ids,
-            new Dictionary<int, int> { [100] = 3, [200] = 2 },
+        var analysis = Evaluate(
+            Plan(("Navigation", 3), ("Gunnery", 3)),
+            active: Levels(),
+            trained: Levels(),
             Queue(
-                new QueueEntry(100, 4, Later),
-                new QueueEntry(200, 3, Soon)));
-
+                new QueueEntry(100, 5, Soon, Later, 3),
+                new QueueEntry(100, 3, Soon, Soon, 1),
+                new QueueEntry(200, 3, Soon, Later, 2)));
         Assert.Equal(PlanReadiness.Training, analysis.Readiness);
         Assert.Equal(Later, analysis.EstimatedFinishUtc);
+        Assert.Equal(Soon, analysis.Requirements[0].QueuedFinishUtc);
     }
 
     [Fact]
-    public void MissingWinsOverTraining()
+    public void PausedQueueIsTrainingWithExplicitUnknownTiming()
     {
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Navigation", 4), ("Gunnery", 3)),
-            Ids,
-            new Dictionary<int, int> { [100] = 3 },
-            Queue(new QueueEntry(100, 4, Soon))); // Gunnery neither trained nor queued
-
-        Assert.Equal(PlanReadiness.Missing, analysis.Readiness);
-        Assert.Null(analysis.EstimatedFinishUtc);
-        Assert.Equal("Gunnery", Assert.Single(analysis.MissingSkills).SkillName);
-    }
-
-    [Fact]
-    public void UnresolvedSkillNameMakesThePlanMissing_NeverSatisfied()
-    {
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Mystery Skill", 1)),
-            Ids,
-            new Dictionary<int, int> { [100] = 5 },
-            Queue());
-
-        Assert.Equal(PlanReadiness.Missing, analysis.Readiness);
-        Assert.Equal("Mystery Skill", Assert.Single(analysis.UnknownSkills));
-    }
-
-    [Fact]
-    public void PausedQueueIsTrainingWithNoEta()
-    {
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Navigation", 4)),
-            Ids,
-            new Dictionary<int, int> { [100] = 3 },
-            Queue(new QueueEntry(100, 4, FinishDate: null)));
-
+        var analysis = Evaluate(Plan(("Navigation", 4)), Levels(), Levels(), Queue(new QueueEntry(100, 4, null, null)));
         Assert.Equal(PlanReadiness.Training, analysis.Readiness);
+        Assert.True(analysis.QueueTimingUnknown);
         Assert.Null(analysis.EstimatedFinishUtc);
     }
 
     [Fact]
-    public void RequirementIsSatisfiedByTheSmallestSufficientQueueEntry()
+    public void MissingAndUnknownRemainDistinct()
     {
-        // Level 3 required with III/IV/V queued: the ETA is the III entry's, not V's.
-        var analysis = SkillPlanEvaluator.Evaluate(
-            Plan(("Navigation", 3)),
-            Ids,
-            new Dictionary<int, int>(),
-            Queue(
-                new QueueEntry(100, 5, Later),
-                new QueueEntry(100, 3, Soon),
-                new QueueEntry(100, 4, Later)));
-
-        Assert.Equal(PlanReadiness.Training, analysis.Readiness);
-        Assert.Equal(Soon, analysis.EstimatedFinishUtc);
+        var missing = Evaluate(Plan(("Navigation", 4)), Levels(), Levels());
+        var unknown = Evaluate(Plan(("Mystery", 1)), Levels(), Levels());
+        Assert.Equal(PlanReadiness.Missing, missing.Readiness);
+        Assert.Equal(RequirementState.Missing, Assert.Single(missing.Requirements).State);
+        Assert.Equal(PlanReadiness.Unknown, unknown.Readiness);
+        Assert.Equal(RequirementState.Unknown, Assert.Single(unknown.Requirements).State);
     }
 
     [Fact]
-    public void EmptyPlanEvaluatesReady_WhichIsWhyPlanStoreMustSkipEmptyPlans()
+    public void NeverFetchedIsUnscoredAndDoesNotPretendMissing()
     {
-        // Documents the vacuous-truth behavior PlanStore.LoadAll guards against:
-        // a plan with zero requirements satisfies every character trivially.
-        var analysis = SkillPlanEvaluator.Evaluate(Plan(), Ids, new Dictionary<int, int>(), Queue());
-        Assert.Equal(PlanReadiness.Ready, analysis.Readiness);
+        var analysis = SkillPlanEvaluator.Evaluate(Plan(("Navigation", 1)), Ids, Levels(), Levels(), Queue(), hasSnapshot: false);
+        Assert.Equal(PlanReadiness.Unscored, analysis.Readiness);
+        Assert.Empty(analysis.Requirements);
     }
+
+    [Fact]
+    public void StatusPrecedencePreservesConservativeMixedOutcomes()
+    {
+        Assert.Equal(PlanReadiness.Unknown, SkillPlanEvaluator.CompactStatus([
+            Item(RequirementState.Missing), Item(RequirementState.Unknown)]));
+        Assert.Equal(PlanReadiness.Missing, SkillPlanEvaluator.CompactStatus([
+            Item(RequirementState.Queued), Item(RequirementState.Missing)]));
+        Assert.Equal(PlanReadiness.Locked, SkillPlanEvaluator.CompactStatus([
+            Item(RequirementState.Queued), Item(RequirementState.TrainedInactive)]));
+    }
+
+    private static PlanAnalysis Evaluate(
+        SkillPlan plan,
+        IReadOnlyDictionary<int, int> active,
+        IReadOnlyDictionary<int, int> trained,
+        ILookup<int, QueueEntry>? queue = null)
+        => SkillPlanEvaluator.Evaluate(plan, Ids, active, trained, queue ?? Queue(), hasSnapshot: true);
+
+    private static RequirementAnalysis Item(RequirementState state) => new("x", 1, 0, 0, state, null, false);
+    private static Dictionary<int, int> Levels(params (int Id, int Level)[] entries)
+        => entries.ToDictionary(entry => entry.Id, entry => entry.Level);
 }

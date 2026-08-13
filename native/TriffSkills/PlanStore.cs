@@ -1,29 +1,24 @@
 using System.IO;
 using System.Text;
+using TriffView.Eve;
 
 namespace TriffView.TriffSkills;
 
-// What a read of the plans directory produced: the usable plans, the .txt files that
-// contained no valid skill line (surfaced so a typo'd file does not silently vanish),
-// and the newest file write time for the "Plans updated" stamp.
+internal sealed record PlanFileIssue(string FileName, string Message, IReadOnlyList<PlanDiagnostic> Diagnostics);
 internal sealed record PlanLoadResult(
     IReadOnlyList<SkillPlan> Plans,
-    IReadOnlyList<string> SkippedFiles,
+    IReadOnlyList<PlanFileIssue> Issues,
     DateTimeOffset? LatestWriteUtc);
+internal sealed record PlanCommitResult(bool Success, bool Collision, string Name, SkillPlan? Plan, string Error);
 
-// Owns the on-disk plans directory: seeds it on first run and reads whatever is there.
-// Plan files are dropped into %APPDATA%\TriffHud\TriffSkills\plans by hand or written
-// by the clipboard import. The directory is the authoritative copy of the user's plans.
 internal static class PlanStore
 {
     public const string StarterPlanName = "Core Ship Skills";
+    public const int MaxPlanFiles = 200;
+    public const long MaxPlanFileBytes = 512 * 1024;
 
-    // Written on first run so the tool opens with a populated matrix instead of an
-    // empty grid. Original content: a plain list of core support skills nearly every
-    // character trains anyway, written for this purpose.
     private const string StarterPlanContents = """
-        # Core support skills - the ones nearly every ship benefits from.
-        # Format: a skill name, then a level as 1-5 or I-V. Delete this file if you like.
+        # Core support skills - one skill per line, followed by level I-V or 1-5.
         CPU Management IV
         Power Grid Management IV
         Capacitor Management III
@@ -42,68 +37,150 @@ internal static class PlanStore
         Drones III
         """;
 
-    // Seeds the starter plan, keyed on the plans directory not existing at all - the
-    // only reliable first-run signal. A user who deletes the starter plan, or every
-    // plan, must not have one reappear. Best-effort: a failure here costs a
-    // convenience file and must not take the tool down.
-    public static void EnsureSeeded(string plansDir)
+    public static string EnsureSeeded(string plansDir)
     {
         try
         {
-            if (Directory.Exists(plansDir)) return;
-
+            if (Directory.Exists(plansDir)) return string.Empty;
             Directory.CreateDirectory(plansDir);
-            File.WriteAllText(
+            AtomicFile.WriteText(
                 Path.Combine(plansDir, StarterPlanName + ".txt"),
-                // CRLF so Notepad on older Windows renders the line breaks.
-                StarterPlanContents.ReplaceLineEndings("\r\n"),
-                new UTF8Encoding(false)
-            );
+                StarterPlanContents.ReplaceLineEndings("\r\n"));
+            return string.Empty;
         }
-        catch (Exception)
+        catch (Exception exception) when (IsFileFailure(exception))
         {
-            // Permission-denied %APPDATA%, read-only profile: the tool works with no
-            // plans at all, so there is nothing to report and nothing to retry.
+            return $"Could not create the starter plan: {exception.Message}";
         }
     }
 
-    // Parses every .txt into a plan named after its file stem. A file that cannot be
-    // read or parsed is skipped rather than failing the whole load, and a file with no
-    // valid skill line is reported in SkippedFiles rather than scored: a plan with
-    // zero requirements would evaluate as Ready for every character.
     public static PlanLoadResult LoadAll(string plansDir)
     {
-        if (!Directory.Exists(plansDir))
+        if (!Directory.Exists(plansDir)) return new PlanLoadResult([], [], null);
+
+        var paths = Directory.EnumerateFiles(plansDir, "*.txt", SearchOption.TopDirectoryOnly)
+            .OrderBy(path => path, StringComparer.OrdinalIgnoreCase)
+            .Take(MaxPlanFiles + 1)
+            .ToArray();
+        var plans = new List<SkillPlan>();
+        var issues = new List<PlanFileIssue>();
+        DateTimeOffset? latest = null;
+
+        if (paths.Length > MaxPlanFiles)
         {
-            return new PlanLoadResult(Array.Empty<SkillPlan>(), Array.Empty<string>(), null);
+            issues.Add(new PlanFileIssue("plans", $"Only the first {MaxPlanFiles:N0} plan files were loaded.", []));
+            paths = paths.Take(MaxPlanFiles).ToArray();
         }
 
-        var plans = new List<SkillPlan>();
-        var skipped = new List<string>();
-        DateTimeOffset? latest = null;
-        foreach (var path in Directory.GetFiles(plansDir, "*.txt").OrderBy(path => path, StringComparer.OrdinalIgnoreCase))
+        var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var path in paths)
         {
+            var fileName = Path.GetFileName(path);
             try
             {
-                var plan = SkillPlanParser.Parse(Path.GetFileNameWithoutExtension(path), File.ReadAllText(path));
-                if (plan.Requirements.Count == 0)
+                if (!PlanNameValidator.TryValidate(Path.GetFileNameWithoutExtension(path), out var planName, out var nameError))
                 {
-                    skipped.Add(Path.GetFileName(path));
+                    issues.Add(new PlanFileIssue(fileName, nameError, []));
+                    continue;
+                }
+                if (!seenNames.Add(planName))
+                {
+                    issues.Add(new PlanFileIssue(fileName, "Plan name collides case-insensitively with another file.", []));
                     continue;
                 }
 
-                plans.Add(plan);
-                var written = new DateTimeOffset(File.GetLastWriteTimeUtc(path), TimeSpan.Zero);
+                var info = new FileInfo(path);
+                if (info.Length > MaxPlanFileBytes)
+                {
+                    issues.Add(new PlanFileIssue(fileName, $"Plan exceeds the {MaxPlanFileBytes / 1024} KiB file limit.", []));
+                    continue;
+                }
+
+                var parsed = SkillPlanParser.Parse(planName, AtomicFile.ReadBoundedText(path, MaxPlanFileBytes));
+                if (!parsed.IsValid)
+                {
+                    issues.Add(new PlanFileIssue(fileName, "Plan has invalid lines and was not loaded.", parsed.Diagnostics));
+                    continue;
+                }
+
+                plans.Add(parsed.Plan!);
+                var written = new DateTimeOffset(info.LastWriteTimeUtc, TimeSpan.Zero);
                 if (latest is null || written > latest) latest = written;
             }
-            catch (Exception)
+            catch (Exception exception) when (IsFileFailure(exception) || exception is InvalidDataException)
             {
-                // Unreadable (locked, permission-denied) or unparseable: skip this one
-                // file, keep the rest.
-                skipped.Add(Path.GetFileName(path));
+                issues.Add(new PlanFileIssue(fileName, $"Could not read plan: {exception.Message}", []));
             }
         }
-
-        return new PlanLoadResult(plans, skipped, latest);
+        return new PlanLoadResult(plans, issues, latest);
     }
+
+    public static PlanCommitResult CommitValidated(
+        string plansDir,
+        string requestedName,
+        string contents,
+        SkillPlan validatedPlan,
+        bool replace)
+    {
+        if (!PlanNameValidator.TryValidate(requestedName, out var name, out var error))
+        {
+            return new PlanCommitResult(false, false, requestedName, null, error);
+        }
+
+        Directory.CreateDirectory(plansDir);
+        var existing = FindExistingPath(plansDir, name);
+        if (existing is not null && !replace) return new PlanCommitResult(false, true, name, null, string.Empty);
+        if (existing is null && Directory.EnumerateFiles(plansDir, "*.txt").Take(MaxPlanFiles).Count() >= MaxPlanFiles)
+        {
+            return new PlanCommitResult(false, false, name, null, $"Plan folder already contains the {MaxPlanFiles:N0}-file maximum.");
+        }
+
+        var path = existing ?? Path.GetFullPath(Path.Combine(plansDir, name + ".txt"));
+        if (!PlanNameValidator.IsWithin(path, plansDir))
+        {
+            return new PlanCommitResult(false, false, name, null, "Plan path escaped the plans folder.");
+        }
+
+        var existed = File.Exists(path);
+        try
+        {
+            AtomicFile.WriteText(path, contents.ReplaceLineEndings("\r\n"));
+            var info = new FileInfo(path);
+            if (info.Length > MaxPlanFileBytes) throw new InvalidDataException("Saved plan exceeded the file-size limit.");
+            var reloaded = SkillPlanParser.Parse(name, AtomicFile.ReadBoundedText(path, MaxPlanFileBytes));
+            if (!reloaded.IsValid || reloaded.Plan is null || !SameRequirements(validatedPlan, reloaded.Plan))
+            {
+                throw new InvalidDataException("Saved plan did not reload as the validated preview.");
+            }
+            return new PlanCommitResult(true, false, name, reloaded.Plan, string.Empty);
+        }
+        catch (Exception exception) when (IsFileFailure(exception) || exception is InvalidDataException)
+        {
+            try
+            {
+                if (existed) AtomicFile.RestoreBackup(path, MaxPlanFileBytes);
+                else
+                {
+                    if (File.Exists(path)) File.Delete(path);
+                    if (File.Exists(path + ".bak")) File.Delete(path + ".bak");
+                }
+            }
+            catch (Exception rollback) when (IsFileFailure(rollback))
+            {
+                return new PlanCommitResult(false, false, name, null, $"Plan save failed and rollback also failed: {rollback.Message}");
+            }
+            return new PlanCommitResult(false, false, name, null, $"Plan was not saved: {exception.Message}");
+        }
+    }
+
+    private static string? FindExistingPath(string plansDir, string name)
+        => Directory.EnumerateFiles(plansDir, "*.txt", SearchOption.TopDirectoryOnly)
+            .FirstOrDefault(path => PlanNameValidator.TryValidate(Path.GetFileNameWithoutExtension(path), out var existingName, out _)
+                && string.Equals(existingName, name, StringComparison.OrdinalIgnoreCase));
+
+    private static bool SameRequirements(SkillPlan left, SkillPlan right)
+        => left.Requirements.SequenceEqual(right.Requirements);
+
+    private static bool IsFileFailure(Exception exception)
+        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
 }

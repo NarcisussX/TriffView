@@ -1,15 +1,11 @@
+using System.Globalization;
 using System.IO;
+using System.Text;
 
 namespace TriffView.TriffSkills;
 
-// Authoritative rules for a plan name arriving in a triffskills:import-plan web
-// message. The renderer runs an advisory copy of these rules while the user types,
-// but a web message can carry any string, so this side rejects rather than
-// sanitizes: an unacceptable name is refused, not silently rewritten.
 internal static class PlanNameValidator
 {
-    // Windows reserved device names: reserved as the whole stem or with any extension
-    // attached (CON.txt is still CON), case-insensitive.
     private static readonly HashSet<string> ReservedDeviceNames = new(StringComparer.OrdinalIgnoreCase)
     {
         "CON", "PRN", "AUX", "NUL",
@@ -17,64 +13,69 @@ internal static class PlanNameValidator
         "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
     };
 
-    private static readonly char[] InvalidNameChars = Path.GetInvalidFileNameChars();
-
     public const int MaxNameLength = 120;
 
-    public static bool TryValidate(string? name, out string error)
+    public static bool TryValidate(string? name, out string normalizedName, out string error)
     {
-        name ??= "";
-
-        if (string.IsNullOrWhiteSpace(name))
+        try
+        {
+            normalizedName = (name ?? string.Empty).Normalize(NormalizationForm.FormC);
+        }
+        catch (ArgumentException)
+        {
+            normalizedName = string.Empty;
+            error = "Plan name contains invalid Unicode.";
+            return false;
+        }
+        if (string.IsNullOrWhiteSpace(normalizedName))
         {
             error = "Plan name cannot be empty.";
             return false;
         }
-        if (name.Length > MaxNameLength)
+        if (normalizedName.Length > MaxNameLength)
         {
             error = $"Plan name is too long (max {MaxNameLength} characters).";
             return false;
         }
-        if (name != name.Trim())
+        if (normalizedName != normalizedName.Trim())
         {
             error = "Plan name cannot start or end with whitespace.";
             return false;
         }
-        // Windows silently strips a trailing dot, so "foo." and "foo" would collide.
-        if (name.EndsWith('.'))
+        if (normalizedName.EndsWith('.') || normalizedName.EndsWith(' '))
         {
-            error = "Plan name cannot end with a period.";
+            error = "Plan name cannot end with a period or space.";
             return false;
         }
-        // GetInvalidFileNameChars covers '/', '\\' and ':'; ".." is made of
-        // otherwise-valid characters, so it needs its own check.
-        if (name.IndexOfAny(InvalidNameChars) >= 0 || name.Contains(".."))
+        if (normalizedName.IndexOfAny(Path.GetInvalidFileNameChars()) >= 0 || normalizedName.Contains("..", StringComparison.Ordinal))
         {
             error = "Plan name contains characters that are not allowed in a file name.";
             return false;
         }
-        // The segment before the *first* dot is what Windows reserves -
-        // Path.GetFileNameWithoutExtension would miss "CON.txt.bak".
-        var stem = name.Split('.')[0];
+        if (normalizedName.Any(character => CharUnicodeInfo.GetUnicodeCategory(character) == UnicodeCategory.Control))
+        {
+            error = "Plan name contains a control character.";
+            return false;
+        }
+
+        var stem = normalizedName.Split('.')[0];
         if (ReservedDeviceNames.Contains(stem))
         {
             error = $"\"{stem}\" is a reserved Windows device name.";
             return false;
         }
 
-        error = "";
+        error = string.Empty;
         return true;
     }
 
-    // Defense in depth: whatever TryValidate misses, this is what actually stops a
-    // write from landing outside root.
+    public static bool TryValidate(string? name, out string error)
+        => TryValidate(name, out _, out error);
+
     public static bool IsWithin(string fullPath, string root)
     {
-        var fullRoot = Path.GetFullPath(root)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var fullRoot = Path.GetFullPath(root).TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
         var candidate = Path.GetFullPath(fullPath);
-        return candidate.Equals(fullRoot, StringComparison.OrdinalIgnoreCase)
-            || candidate.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase)
-            || candidate.StartsWith(fullRoot + Path.AltDirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
+        return candidate.StartsWith(fullRoot + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase);
     }
 }

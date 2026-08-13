@@ -1,0 +1,412 @@
+.triffskills .triffview-section-content {
+  gap: 10px;
+}
+
+.triffskills-header {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.triffskills-header p,
+.triffskills-panel p {
+  margin: 4px 0 0;
+  color: var(--tv-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.triffskills-actions,
+.triffskills-character > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
+}
+
+.triffskills button,
+.triffskills input,
+.triffskills textarea {
+  border: 1px solid var(--tv-border);
+  border-radius: 0;
+  background: var(--tv-control-bg);
+  color: var(--tv-text);
+  font: inherit;
+}
+
+.triffskills button {
+  min-height: 28px;
+  padding: 4px 8px;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.triffskills button:hover:not(:disabled),
+.triffskills button:focus-visible {
+  border-color: var(--tv-accent);
+  color: var(--tv-white);
+}
+
+.triffskills button:disabled {
+  cursor: not-allowed;
+  color: var(--tv-disabled);
+}
+
+.triffskills button.primary-action {
+  border-color: var(--tv-accent);
+  background: var(--tv-accent-bg);
+}
+
+.triffskills button.danger-action {
+  border-color: var(--tv-danger-border-soft);
+  background: rgba(var(--tv-danger-bg-rgb), 0.28);
+  color: var(--tv-danger-text);
+}
+
+.triffskills-notice {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  border: 1px solid var(--tv-border-soft);
+  background: var(--tv-control-bg-alt);
+  padding: 7px 9px;
+  color: var(--tv-warning-text);
+  font-size: 11px;
+}
+
+.triffskills-notice.is-error {
+  border-color: var(--tv-danger-border-soft);
+  background: rgba(var(--tv-danger-bg-rgb), 0.25);
+  color: var(--tv-danger-text);
+}
+
+.triffskills-workspace {
+  display: grid;
+  min-height: 0;
+  flex: 1 1 auto;
+  grid-template-columns: minmax(0, 1fr) minmax(280px, 360px);
+  gap: 10px;
+}
+
+.triffskills-main,
+.triffskills-sidebar {
+  min-width: 0;
+  min-height: 0;
+}
+
+.triffskills-main {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.triffskills-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: auto;
+}
+
+.triffskills-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  color: var(--tv-muted);
+  font-size: 10px;
+}
+
+.triffskills-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.triffskills-legend b,
+.triffskills-cell,
+.triffskills-detail-title > b {
+  color: var(--tv-muted);
+}
+
+.triffskills .is-ready { color: var(--tv-success-text); }
+.triffskills .is-training { color: var(--tv-accent-text); }
+.triffskills .is-locked { color: var(--tv-warning-text); }
+.triffskills .is-missing { color: var(--tv-muted); }
+.triffskills .is-unknown { color: var(--tv-danger-text); }
+.triffskills .is-unscored { color: var(--tv-muted); opacity: 0.65; }
+
+.triffskills-empty {
+  border: 1px dashed var(--tv-border-dashed);
+  padding: 18px;
+  color: var(--tv-muted);
+  font-size: 12px;
+}
+
+.triffskills-matrix-scroll {
+  min-height: 180px;
+  flex: 1 1 auto;
+  overflow: auto;
+  border: 1px solid var(--tv-border-soft);
+  background: rgba(var(--tv-bg-rgb), 0.88);
+}
+
+.triffskills-matrix {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: separate;
+  border-spacing: 0;
+  table-layout: fixed;
+  font-size: 11px;
+}
+
+.triffskills-matrix th,
+.triffskills-matrix td {
+  border-right: 1px solid var(--tv-border-muted);
+  border-bottom: 1px solid var(--tv-border-muted);
+  padding: 0;
+}
+
+.triffskills-matrix thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  width: 30px;
+  height: 128px;
+  background: var(--tv-table-head-bg);
+  vertical-align: bottom;
+}
+
+.triffskills-matrix thead th > span {
+  display: block;
+  overflow: hidden;
+  padding: 5px 7px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  writing-mode: vertical-rl;
+  transform: rotate(180deg);
+}
+
+.triffskills-matrix thead th.has-warning {
+  box-shadow: inset 0 3px 0 var(--tv-danger-border-soft);
+}
+
+.triffskills-matrix .triffskills-plan-heading {
+  left: 0;
+  z-index: 4;
+  width: 190px;
+  height: auto;
+  padding: 6px 8px;
+  vertical-align: bottom;
+  text-align: left;
+}
+
+.triffskills-matrix tbody th {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  width: 190px;
+  max-width: 190px;
+  background: var(--tv-control-bg-alt);
+  padding: 4px 8px;
+  color: var(--tv-text-strong);
+  text-align: left;
+}
+
+.triffskills-matrix tbody th strong {
+  display: inline-block;
+  max-width: 152px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+
+.triffskills-matrix tbody th small {
+  float: right;
+  color: var(--tv-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.triffskills-matrix td {
+  width: 30px;
+  height: 28px;
+  background: var(--tv-control-bg);
+}
+
+.triffskills-cell {
+  width: 100%;
+  height: 100%;
+  border: 0 !important;
+  background: transparent !important;
+  padding: 0 !important;
+  font-size: 14px !important;
+}
+
+.triffskills-cell:hover,
+.triffskills-cell:focus-visible,
+.triffskills-cell.is-selected {
+  background: rgba(var(--tv-accent-rgb), 0.2) !important;
+  outline: 1px solid var(--tv-accent);
+  outline-offset: -2px;
+}
+
+.triffskills-issues,
+.triffskills-panel {
+  border: 1px solid var(--tv-border-soft);
+  background: var(--tv-control-bg-alt);
+  padding: 9px 10px;
+  font-size: 11px;
+}
+
+.triffskills-issues summary {
+  cursor: pointer;
+  color: var(--tv-warning-text);
+  font-weight: 800;
+}
+
+.triffskills-issues div {
+  margin-top: 7px;
+}
+
+.triffskills-issues p {
+  margin: 3px 0 0 10px;
+  color: var(--tv-muted);
+}
+
+.triffskills-panel h3 {
+  margin: 0 0 7px;
+  color: var(--tv-text-strong);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+
+.triffskills-character {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border-top: 1px solid var(--tv-border-muted);
+  padding: 7px 0;
+}
+
+.triffskills-character:first-of-type {
+  border-top: 0;
+}
+
+.triffskills-character > div:first-child,
+.triffskills-detail-title {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.triffskills-character small,
+.triffskills-detail small {
+  color: var(--tv-muted);
+}
+
+.triffskills-character p.is-error {
+  margin: 0;
+  color: var(--tv-danger-text);
+}
+
+.triffskills-detail-title > b {
+  margin-top: 4px;
+}
+
+.triffskills-requirements {
+  max-height: 300px;
+  overflow: auto;
+  margin: 9px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.triffskills-requirements li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 7px;
+  border-top: 1px solid var(--tv-border-muted);
+  padding: 5px 0;
+}
+
+.triffskills-requirements li > span {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.triffskills-requirements li strong {
+  overflow: hidden;
+  color: var(--tv-text-strong);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.triffskills-import label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 8px;
+  color: var(--tv-muted);
+  font-weight: 700;
+}
+
+.triffskills-import input,
+.triffskills-import textarea {
+  width: 100%;
+  padding: 6px 7px;
+  resize: vertical;
+}
+
+.triffskills-import > button {
+  margin-top: 8px;
+}
+
+.triffskills-preview {
+  margin-top: 9px;
+  border: 1px solid var(--tv-border-muted);
+  padding: 8px;
+}
+
+.triffskills-preview.is-valid { border-color: var(--tv-success-border); }
+.triffskills-preview.is-invalid { border-color: var(--tv-danger-border-soft); color: var(--tv-danger-text); }
+
+.triffskills-preview ul {
+  max-height: 150px;
+  overflow: auto;
+  margin: 6px 0;
+  padding-left: 18px;
+}
+
+@media (max-width: 980px) {
+  .triffskills-workspace {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .triffskills-sidebar {
+    overflow: visible;
+  }
+}
+
+@media (max-width: 680px) {
+  .triffskills-header {
+    flex-direction: column;
+  }
+
+  .triffskills-actions {
+    justify-content: flex-start;
+  }
+
+  .triffskills-matrix .triffskills-plan-heading,
+  .triffskills-matrix tbody th {
+    width: 145px;
+    max-width: 145px;
+  }
+
+  .triffskills-matrix tbody th strong {
+    max-width: 108px;
+  }
+}

@@ -1,146 +1,133 @@
-using System.Diagnostics;
 using System.IO;
-using System.Text;
 using System.Text.Json;
+using TriffView.Eve;
 
 namespace TriffView.TriffSkills;
 
-// Name -> typeID map persisted at %APPDATA%\TriffHud\TriffSkills\skill-ids.json.
-// Load-bearing, not an optimisation: skill names are immutable once resolved, so only
-// unseen names are ever sent to ESI. Do not add a TTL and do not clear it on refresh.
+internal sealed record ValidatedSkillType(int TypeId, int GroupId, int CategoryId = 16);
+internal sealed class SkillIdCacheModel
+{
+    public int Version { get; set; }
+    public Dictionary<string, ValidatedSkillType> Skills { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+}
+internal sealed record SkillCacheLoadResult(SkillIdCache Cache, string Warning);
+
 internal sealed class SkillIdCache
 {
-    // POST /universe/ids/ declares maxItems: 500 on its request body.
+    private const long MaxCacheFileBytes = 4 * 1024 * 1024;
+    public const int SchemaVersion = 3;
     public const int BatchSize = 500;
+    public const int MaxEntries = 20_000;
 
-    private static readonly JsonSerializerOptions JsonOptions = new() { WriteIndented = true };
+    public Dictionary<string, ValidatedSkillType> Map { get; } = new(StringComparer.OrdinalIgnoreCase);
 
-    // Case-insensitive because plan files are hand-written and ESI resolves names
-    // case-insensitively.
-    public Dictionary<string, int> Map { get; } = new(StringComparer.OrdinalIgnoreCase);
-
-    public static string CachePath => TriffSkillsPaths.SkillIdsPath;
-
-    public static SkillIdCache Load()
+    public static SkillCacheLoadResult Load()
     {
+        var path = TriffSkillsPaths.SkillIdsPath;
+        if (!File.Exists(path)) return new SkillCacheLoadResult(new SkillIdCache(), string.Empty);
         try
         {
-            return File.Exists(CachePath) ? FromJson(File.ReadAllText(CachePath)) : new SkillIdCache();
+            return new SkillCacheLoadResult(FromJson(AtomicFile.ReadBoundedText(path, MaxCacheFileBytes)), string.Empty);
         }
-        catch
+        catch (Exception exception) when (exception is JsonException or InvalidDataException or System.Text.DecoderFallbackException)
         {
-            // A corrupt cache costs one round of re-resolution, not a broken tool.
-            return new SkillIdCache();
+            var preserved = string.Empty;
+            try { preserved = AtomicFile.PreserveCorrupt(path); }
+            catch (Exception preserveError) when (IsFileFailure(preserveError))
+            {
+                return new SkillCacheLoadResult(new SkillIdCache(), $"Skill cache is corrupt and could not be preserved: {preserveError.Message}");
+            }
+
+            var backup = path + ".bak";
+            if (File.Exists(backup))
+            {
+                try
+                {
+                    var recovered = FromJson(AtomicFile.ReadBoundedText(backup, MaxCacheFileBytes));
+                    recovered.TrySave(out _);
+                    return new SkillCacheLoadResult(recovered, $"Recovered the validated skill cache from backup. Corrupt file: {preserved}");
+                }
+                catch (Exception backupError) when (backupError is JsonException or InvalidDataException or System.Text.DecoderFallbackException || IsFileFailure(backupError))
+                {
+                    return new SkillCacheLoadResult(new SkillIdCache(), $"Skill cache and backup are unreadable. Corrupt file: {preserved}. {backupError.Message}");
+                }
+            }
+            return new SkillCacheLoadResult(new SkillIdCache(), $"Skill cache was corrupt and preserved at {preserved}. {exception.Message}");
+        }
+        catch (Exception exception) when (IsFileFailure(exception))
+        {
+            return new SkillCacheLoadResult(new SkillIdCache(), $"Could not read validated skill cache: {exception.Message}");
         }
     }
 
     public static SkillIdCache FromJson(string json)
     {
+        var model = JsonSerializer.Deserialize<SkillIdCacheModel>(json, TriffSkillsJson.Options)
+            ?? throw new JsonException("Skill cache JSON was empty.");
+        if (model.Version != SchemaVersion) throw new JsonException($"Unsupported skill cache version {model.Version}.");
         var cache = new SkillIdCache();
-        var map = JsonSerializer.Deserialize<Dictionary<string, int>>(json);
-        foreach (var pair in map ?? new Dictionary<string, int>())
+        foreach (var pair in (model.Skills ?? []).Take(MaxEntries))
         {
-            // Copied entry by entry: System.Text.Json builds its own dictionary with
-            // the default comparer, which would lose case-insensitivity.
-            if (string.IsNullOrWhiteSpace(pair.Key) || pair.Value <= 0) continue;
+            if (string.IsNullOrWhiteSpace(pair.Key)
+                || pair.Value is null
+                || pair.Value.TypeId <= 0
+                || pair.Value.GroupId <= 0
+                || pair.Value.CategoryId != 16) continue;
             cache.Map[pair.Key.Trim()] = pair.Value;
         }
-
         return cache;
     }
 
-    // Write-temp-then-replace with a unique temp name, same contract as
-    // TriffSkillsState.TrySave. Pure derived data, so a failed write is logged and
-    // dropped rather than propagated into the refresh that triggered it.
-    public void Save()
+    public bool TrySave(out string error)
     {
-        var path = CachePath;
-        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
         try
         {
-            Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-
-            File.WriteAllText(temp, JsonSerializer.Serialize(Map, JsonOptions), new UTF8Encoding(false));
-
-            if (File.Exists(path)) File.Replace(temp, path, null);
-            else File.Move(temp, path);
+            var model = new SkillIdCacheModel
+            {
+                Version = SchemaVersion,
+                Skills = Map.Take(MaxEntries).ToDictionary(pair => pair.Key, pair => pair.Value, StringComparer.OrdinalIgnoreCase),
+            };
+            AtomicFile.WriteText(TriffSkillsPaths.SkillIdsPath, JsonSerializer.Serialize(model, TriffSkillsJson.Options));
+            error = string.Empty;
+            return true;
         }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
+        catch (Exception exception) when (IsFileFailure(exception) || exception is JsonException)
         {
-            Debug.WriteLine($"TriffSkills: skill id cache save failed: {ex.Message}");
-            try
-            {
-                if (File.Exists(temp)) File.Delete(temp);
-            }
-            catch (Exception cleanup) when (cleanup is IOException or UnauthorizedAccessException)
-            {
-                // A stray temp file is harmless.
-            }
+            error = exception.Message;
+            return false;
         }
     }
 
-    public static List<string> Unresolved(IReadOnlyDictionary<string, int> map, IEnumerable<string> names)
-    {
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        var missing = new List<string>();
-        foreach (var name in names)
-        {
-            var trimmed = (name ?? "").Trim();
-            if (trimmed.Length == 0) continue;
-            if (map.ContainsKey(trimmed)) continue;
-            if (!seen.Add(trimmed)) continue;
-            missing.Add(trimmed);
-        }
+    public Dictionary<string, int> TypeIds()
+        => Map.ToDictionary(pair => pair.Key, pair => pair.Value.TypeId, StringComparer.OrdinalIgnoreCase);
 
-        return missing;
+    public List<string> Unresolved(IEnumerable<string> names)
+        => names.Select(name => (name ?? string.Empty).Trim())
+            .Where(name => name.Length > 0 && !Map.ContainsKey(name))
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+    public int Merge(IEnumerable<(string Name, ValidatedSkillType Skill)> resolved)
+    {
+        var added = 0;
+        foreach (var (rawName, skill) in resolved)
+        {
+            var name = (rawName ?? string.Empty).Trim();
+            if (name.Length == 0 || skill.TypeId <= 0 || skill.GroupId <= 0 || skill.CategoryId != 16 || Map.ContainsKey(name) || Map.Count >= MaxEntries) continue;
+            Map[name] = skill;
+            added++;
+        }
+        return added;
     }
 
-    public static List<List<string>> Batch(IReadOnlyList<string> names, int batchSize)
+    public static IReadOnlyList<IReadOnlyList<string>> Batch(IEnumerable<string> names)
     {
-        var size = Math.Max(1, batchSize);
-        var batches = new List<List<string>>();
-        for (var start = 0; start < names.Count; start += size)
-        {
-            batches.Add(names.Skip(start).Take(size).ToList());
-        }
-
+        var values = names.ToList();
+        var batches = new List<IReadOnlyList<string>>();
+        for (var offset = 0; offset < values.Count; offset += BatchSize) batches.Add(values.Skip(offset).Take(BatchSize).ToArray());
         return batches;
     }
 
-    public static int Merge(IDictionary<string, int> map, IEnumerable<SkillsUniverseIdName> resolved)
-    {
-        var added = 0;
-        foreach (var entry in resolved)
-        {
-            if (string.IsNullOrWhiteSpace(entry.Name) || entry.Id <= 0) continue;
-            var name = entry.Name.Trim();
-            if (map.ContainsKey(name)) continue;
-            map[name] = entry.Id;
-            added++;
-        }
-
-        return added;
-    }
-
-    public async Task<int> ResolveMissingAsync(
-        IEnumerable<string> names,
-        Func<IReadOnlyList<string>, Task<IReadOnlyList<SkillsUniverseIdName>>> resolver,
-        bool persist = true)
-    {
-        var missing = Unresolved(Map, names);
-        if (missing.Count == 0) return 0;
-
-        var added = 0;
-        foreach (var batch in Batch(missing, BatchSize))
-        {
-            // Names ESI does not recognise are simply absent from the response, stay
-            // out of the map, and surface downstream as UnknownSkills rather than as
-            // satisfied requirements.
-            var resolved = await resolver(batch);
-            added += Merge(Map, resolved);
-        }
-
-        if (added > 0 && persist) Save();
-        return added;
-    }
+    private static bool IsFileFailure(Exception exception)
+        => exception is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException;
 }

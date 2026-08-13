@@ -107,6 +107,7 @@ public partial class MainWindow : Window
 {
     private const string VirtualHostName = "app.triffview.local";
     private const string EmbeddedOverlayResourceName = "TriffView.Assets.overlay-dist.zip";
+    private const int MaxWebMessageCharacters = 1_200_000;
     private static readonly JsonSerializerOptions WebMessageJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -610,15 +611,17 @@ public partial class MainWindow : Window
         JsonObject? message;
         try
         {
-            message = JsonNode.Parse(e.WebMessageAsJson)?.AsObject();
+            var json = e.WebMessageAsJson;
+            if (json.Length > MaxWebMessageCharacters) return;
+            message = JsonNode.Parse(json)?.AsObject();
         }
         catch
         {
             return;
         }
 
-        var type = message?["type"]?.GetValue<string>();
-        if (string.IsNullOrWhiteSpace(type)) return;
+        var type = message?["type"] is JsonValue value && value.TryGetValue<string>(out var parsedType) ? parsedType : string.Empty;
+        if (string.IsNullOrWhiteSpace(type) || type.Length > 128) return;
 
         if (_triffView?.HandleWebMessage(type, message) == true)
         {
@@ -669,10 +672,10 @@ public partial class MainWindow : Window
                 HideSettings();
                 break;
             case "open-external":
-                OpenExternal(message?["url"]?.GetValue<string>());
+                OpenExternal(ReadBridgeString(message, "url", 2_048));
                 break;
             case "copy-text":
-                CopyText(message?["text"]?.GetValue<string>());
+                CopyText(ReadBridgeString(message, "text", MaxWebMessageCharacters));
                 break;
             case "read-clipboard":
                 ReadClipboard();
@@ -690,7 +693,7 @@ public partial class MainWindow : Window
                 OpenUpdateRelease();
                 break;
             case "update:ignore-version":
-                IgnoreUpdateVersion(message?["version"]?.GetValue<string>());
+                IgnoreUpdateVersion(ReadBridgeString(message, "version", 64));
                 break;
             case "settings:get":
             case "standalone:ready":
@@ -699,6 +702,11 @@ public partial class MainWindow : Window
                 break;
         }
     }
+
+    private static string ReadBridgeString(JsonObject? message, string key, int maxLength)
+        => message?[key] is JsonValue value && value.TryGetValue<string>(out var text)
+            ? text[..Math.Min(text.Length, maxLength)]
+            : string.Empty;
 
     private void ApplyStandaloneTheme(JsonObject? theme)
     {
@@ -1115,6 +1123,18 @@ public partial class MainWindow : Window
         {
             _triffView.Dispose();
             _triffView = null;
+        }
+
+        if (_triffSkills != null)
+        {
+            _triffSkills.Dispose();
+            _triffSkills = null;
+        }
+
+        if (_triffFleets != null)
+        {
+            _triffFleets.Dispose();
+            _triffFleets = null;
         }
 
         if (_inputOverlay != null)

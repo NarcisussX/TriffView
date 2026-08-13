@@ -1,114 +1,127 @@
 namespace TriffView.TriffSkills;
 
-// One ESI skill-queue row. ESI emits a separate row per level, and omits FinishDate
-// entirely while the queue is paused.
-internal sealed record QueueEntry(int SkillId, int FinishedLevel, DateTimeOffset? FinishDate);
+internal sealed record QueueEntry(
+    int SkillId,
+    int FinishedLevel,
+    DateTimeOffset? StartDate,
+    DateTimeOffset? FinishDate,
+    int QueuePosition = 0);
+
+internal enum RequirementState
+{
+    Active,
+    TrainedInactive,
+    Queued,
+    Missing,
+    Unknown,
+}
 
 internal enum PlanReadiness
 {
     Ready,
     Training,
+    Locked,
     Missing,
+    Unknown,
+    Unscored,
 }
 
-internal sealed record MissingRequirement(string SkillName, int Level);
+internal sealed record RequirementAnalysis(
+    string SkillName,
+    int RequiredLevel,
+    int? ActiveLevel,
+    int? TrainedLevel,
+    RequirementState State,
+    DateTimeOffset? QueuedFinishUtc,
+    bool QueueTimingUnknown);
 
 internal sealed record PlanAnalysis(
     PlanReadiness Readiness,
     DateTimeOffset? EstimatedFinishUtc,
-    IReadOnlyList<MissingRequirement> MissingSkills,
-    IReadOnlyList<string> UnknownSkills);
+    bool QueueTimingUnknown,
+    IReadOnlyList<RequirementAnalysis> Requirements)
+{
+    public int ActiveCount => Requirements.Count(item => item.State == RequirementState.Active);
+    public int TrainedInactiveCount => Requirements.Count(item => item.State == RequirementState.TrainedInactive);
+    public int QueuedCount => Requirements.Count(item => item.State == RequirementState.Queued);
+    public int MissingCount => Requirements.Count(item => item.State == RequirementState.Missing);
+    public int UnknownCount => Requirements.Count(item => item.State == RequirementState.Unknown);
+}
 
 internal static class SkillPlanEvaluator
 {
-    // Classifies a plan for one character. Missing always wins over Training: a plan
-    // that cannot be completed from the current queue is never reported with an ETA.
-    // The queue arrives pre-grouped by skill ID so scoring a whole matrix does not
-    // rescan the full queue once per requirement.
     public static PlanAnalysis Evaluate(
         SkillPlan plan,
         IReadOnlyDictionary<string, int> skillIds,
+        IReadOnlyDictionary<int, int> activeLevels,
         IReadOnlyDictionary<int, int> trainedLevels,
-        ILookup<int, QueueEntry> queue)
+        ILookup<int, QueueEntry> queue,
+        bool hasSnapshot)
     {
-        var missing = new List<MissingRequirement>();
-        var unknown = new List<string>();
-        var anyTraining = false;
-        var etaIsKnown = true;
-        DateTimeOffset? eta = null;
+        if (!hasSnapshot)
+        {
+            return new PlanAnalysis(PlanReadiness.Unscored, null, false, []);
+        }
 
+        var requirements = new List<RequirementAnalysis>(plan.Requirements.Count);
+        var timingUnknown = false;
+        DateTimeOffset? eta = null;
         foreach (var requirement in plan.Requirements)
         {
             if (!skillIds.TryGetValue(requirement.SkillName, out var skillId))
             {
-                // Unresolvable: cannot be evaluated, so it must never count as satisfied.
-                unknown.Add(requirement.SkillName);
+                requirements.Add(new RequirementAnalysis(requirement.SkillName, requirement.Level, null, null, RequirementState.Unknown, null, false));
                 continue;
             }
 
-            if (trainedLevels.TryGetValue(skillId, out var trained) && trained >= requirement.Level)
+            activeLevels.TryGetValue(skillId, out var active);
+            trainedLevels.TryGetValue(skillId, out var trained);
+            if (active >= requirement.Level)
             {
+                requirements.Add(new RequirementAnalysis(requirement.SkillName, requirement.Level, active, trained, RequirementState.Active, null, false));
+                continue;
+            }
+            if (trained >= requirement.Level)
+            {
+                requirements.Add(new RequirementAnalysis(requirement.SkillName, requirement.Level, active, trained, RequirementState.TrainedInactive, null, false));
                 continue;
             }
 
-            var entry = SmallestSufficientEntry(queue[skillId], requirement.Level);
-            if (entry is null)
+            var queued = EarliestSufficientEntry(queue[skillId], requirement.Level);
+            if (queued is not null)
             {
-                missing.Add(new MissingRequirement(requirement.SkillName, requirement.Level));
+                var unknown = queued.FinishDate is null;
+                timingUnknown |= unknown;
+                if (!unknown && (eta is null || queued.FinishDate > eta)) eta = queued.FinishDate;
+                requirements.Add(new RequirementAnalysis(requirement.SkillName, requirement.Level, active, trained, RequirementState.Queued, queued.FinishDate, unknown));
                 continue;
             }
 
-            anyTraining = true;
-            if (entry.FinishDate is null)
-            {
-                // Paused queue: still training, but the completion date is unknowable.
-                etaIsKnown = false;
-            }
-            else if (eta is null || entry.FinishDate > eta)
-            {
-                eta = entry.FinishDate;
-            }
+            requirements.Add(new RequirementAnalysis(requirement.SkillName, requirement.Level, active, trained, RequirementState.Missing, null, false));
         }
 
-        if (missing.Count > 0 || unknown.Count > 0)
-        {
-            return new PlanAnalysis(PlanReadiness.Missing, null, missing, unknown);
-        }
-
-        if (anyTraining)
-        {
-            return new PlanAnalysis(
-                PlanReadiness.Training,
-                etaIsKnown ? eta?.ToUniversalTime() : null,
-                Array.Empty<MissingRequirement>(),
-                Array.Empty<string>());
-        }
-
+        var readiness = CompactStatus(requirements);
         return new PlanAnalysis(
-            PlanReadiness.Ready,
-            null,
-            Array.Empty<MissingRequirement>(),
-            Array.Empty<string>());
+            readiness,
+            readiness == PlanReadiness.Training && !timingUnknown ? eta?.ToUniversalTime() : null,
+            readiness == PlanReadiness.Training && timingUnknown,
+            requirements);
     }
 
-    // ESI queues one entry per level, so the requirement is satisfied by the earliest
-    // level that reaches it - level III with III/IV/V queued resolves to the III entry.
-    private static QueueEntry? SmallestSufficientEntry(IEnumerable<QueueEntry> entries, int requiredLevel)
+    internal static PlanReadiness CompactStatus(IReadOnlyList<RequirementAnalysis> requirements)
     {
-        QueueEntry? best = null;
-        foreach (var entry in entries)
-        {
-            if (entry.FinishedLevel < requiredLevel)
-            {
-                continue;
-            }
-
-            if (best is null || entry.FinishedLevel < best.FinishedLevel)
-            {
-                best = entry;
-            }
-        }
-
-        return best;
+        if (requirements.Count == 0) return PlanReadiness.Unknown;
+        if (requirements.Any(item => item.State == RequirementState.Unknown)) return PlanReadiness.Unknown;
+        if (requirements.Any(item => item.State == RequirementState.Missing)) return PlanReadiness.Missing;
+        if (requirements.Any(item => item.State == RequirementState.TrainedInactive)) return PlanReadiness.Locked;
+        if (requirements.Any(item => item.State == RequirementState.Queued)) return PlanReadiness.Training;
+        return PlanReadiness.Ready;
     }
+
+    private static QueueEntry? EarliestSufficientEntry(IEnumerable<QueueEntry> entries, int requiredLevel)
+        => entries
+            .Where(entry => entry.FinishedLevel >= requiredLevel)
+            .OrderBy(entry => entry.FinishedLevel)
+            .ThenBy(entry => entry.QueuePosition)
+            .FirstOrDefault();
 }

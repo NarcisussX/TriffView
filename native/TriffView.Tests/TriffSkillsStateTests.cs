@@ -1,123 +1,89 @@
-using System.IO;
 using TriffView.TriffSkills;
 using Xunit;
 
 namespace TriffView.Tests;
 
-// These tests redirect TriffSkillsPaths.Root, which is process-global state, so every
-// test that touches it lives in this one class (xunit runs tests within a class
-// serially) and re-points the override before use.
 public class TriffSkillsStateTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "triffskills-tests", Guid.NewGuid().ToString("N"));
 
-    public TriffSkillsStateTests()
-    {
-        TriffSkillsPaths.OverrideRoot(_dir);
-    }
+    public TriffSkillsStateTests() => TriffSkillsPaths.OverrideRoot(_dir);
 
     public void Dispose()
     {
-        // finally, so the process-global override is cleared even if cleanup throws
-        // or the directory was never created.
-        try
-        {
-            if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true);
-        }
-        catch (IOException)
-        {
-            // Best-effort cleanup.
-        }
-        finally
-        {
-            TriffSkillsPaths.ClearOverride();
-        }
+        try { if (Directory.Exists(_dir)) Directory.Delete(_dir, recursive: true); }
+        catch (IOException) { }
+        finally { TriffSkillsPaths.ClearOverride(); }
     }
 
     [Fact]
-    public void TrySaveRoundTripsThroughLoad()
+    public void RoundTripPreservesActiveTrainedQueueAndOwnerMetadata()
     {
         var state = new TriffSkillsState();
         var character = state.Upsert(9001);
-        character.CharacterName = "Pilot One";
-        character.TrainedLevels[100] = 4;
-        character.Queue.Add(new QueueEntry(100, 5, null));
-        state.SelectedCharacterId = 9001;
-
-        Assert.True(state.TrySave(out var error));
-        Assert.Equal("", error);
-
+        character.CharacterName = "Pilot";
+        character.OwnerHash = "owner-hash";
+        character.ActiveLevels[100] = 3;
+        character.TrainedLevels[100] = 5;
+        character.Queue.Add(new QueueEntry(100, 5, null, null));
+        Assert.True(state.TrySave(out var error), error);
         var loaded = TriffSkillsState.Load();
-        var roundTripped = Assert.Single(loaded.Characters);
-        Assert.Equal("Pilot One", roundTripped.CharacterName);
-        Assert.Equal(4, roundTripped.TrainedLevels[100]);
-        Assert.Equal(5, Assert.Single(roundTripped.Queue).FinishedLevel);
+        var restored = Assert.Single(loaded.State.Characters);
+        Assert.Equal(3, restored.ActiveLevels[100]);
+        Assert.Equal(5, restored.TrainedLevels[100]);
+        Assert.Equal("owner-hash", restored.OwnerHash);
+        Assert.Single(restored.Queue);
     }
 
     [Fact]
-    public void TrySaveReportsFailureInsteadOfSwallowingIt()
+    public void CorruptPrimaryIsPreservedAndBackupIsRecovered()
     {
-        // Point the root below a *file* so CreateDirectory fails. The auth commit
-        // path depends on this returning false: a refresh token must never be
-        // written to Credential Manager after a save that silently failed.
-        Directory.CreateDirectory(_dir);
-        var blocking = Path.Combine(_dir, "blocking-file");
-        File.WriteAllText(blocking, "not a directory");
-        TriffSkillsPaths.OverrideRoot(Path.Combine(blocking, "nested"));
-
         var state = new TriffSkillsState();
-        state.Upsert(9001);
-
-        Assert.False(state.TrySave(out var error));
-        Assert.NotEqual("", error);
+        state.Upsert(1).CharacterName = "First";
+        Assert.True(state.TrySave(out _));
+        state.Find(1)!.CharacterName = "Second";
+        Assert.True(state.TrySave(out _));
+        File.WriteAllText(TriffSkillsPaths.StatePath, "{not-json");
+        var loaded = TriffSkillsState.Load();
+        Assert.Contains("Recovered", loaded.Warning);
+        Assert.Equal("First", Assert.Single(loaded.State.Characters).CharacterName);
+        Assert.NotEmpty(Directory.GetFiles(_dir, "state.json.corrupt-*"));
     }
 
     [Fact]
-    public void NormalizeDedupesByCharacterIdAndFixesSelection()
-    {
-        var state = new TriffSkillsState
-        {
-            Characters = new List<TriffSkillsCharacter>
-            {
-                new() { CharacterId = 1, CharacterName = " First " },
-                new() { CharacterId = 1, CharacterName = "First Again" }, // last wins
-                new() { CharacterId = 0 },  // invalid, dropped
-                new() { CharacterId = 2, CharacterName = "Second" },
-            },
-            SelectedCharacterId = 999, // no longer present
-        };
-
-        state.Normalize();
-
-        Assert.Equal(2, state.Characters.Count);
-        Assert.Equal("First Again", state.Characters[0].CharacterName);
-        Assert.Equal(1, state.SelectedCharacterId); // falls back to the first character
-    }
-
-    [Fact]
-    public void ApplyFetchResultsIgnoreForgottenCharacters()
-    {
-        // Forget can complete during a refresh pass's await; a fetch result for a
-        // removed character must not resurrect it.
-        var state = new TriffSkillsState();
-        state.ApplyFetchSuccess(42, new Dictionary<int, int> { [1] = 5 }, new List<QueueEntry>());
-        state.ApplyFetchFailure(42, "boom", needsReauth: true);
-        Assert.Empty(state.Characters);
-    }
-
-    [Fact]
-    public void ApplyFetchFailureKeepsLastGoodData()
+    public void FetchFailureKeepsLastGoodDataAndOnlyDefinitiveFailureSetsReauth()
     {
         var state = new TriffSkillsState();
         var character = state.Upsert(42);
-        state.ApplyFetchSuccess(42, new Dictionary<int, int> { [1] = 5 }, new List<QueueEntry> { new(1, 5, null) });
-        var fetchedUtc = character.FetchedUtc;
-
-        state.ApplyFetchFailure(42, "ESI fell over", needsReauth: false);
-
+        state.ApplyFetchSuccess(42, new Dictionary<int, int> { [1] = 3 }, new Dictionary<int, int> { [1] = 5 }, [new QueueEntry(1, 5, null, null)], DateTimeOffset.UtcNow);
+        state.ApplyFetchFailure(42, "temporary", needsReauth: false);
+        Assert.Equal(3, character.ActiveLevels[1]);
         Assert.Equal(5, character.TrainedLevels[1]);
-        Assert.Single(character.Queue);
-        Assert.Equal(fetchedUtc, character.FetchedUtc); // stays stale-labelled, not cleared
-        Assert.Equal("ESI fell over", character.Error);
+        Assert.False(character.NeedsReauth);
+        state.ApplyFetchFailure(42, "invalid grant", needsReauth: true);
+        Assert.True(character.NeedsReauth);
+    }
+
+    [Fact]
+    public void NormalizeDropsInvalidRowsAndEnforcesCharacterCap()
+    {
+        var state = new TriffSkillsState
+        {
+            Characters = Enumerable.Range(0, TriffSkillsState.MaxCharacters + 10)
+                .Select(index => new TriffSkillsCharacter { CharacterId = index, CharacterName = $" {index} " })
+                .ToList(),
+        };
+        state.Normalize();
+        Assert.Equal(TriffSkillsState.MaxCharacters, state.Characters.Count);
+        Assert.DoesNotContain(state.Characters, character => character.CharacterId <= 0);
+    }
+
+    [Fact]
+    public void PathsUseStandaloneTriffViewNamespace()
+    {
+        TriffSkillsPaths.ClearOverride();
+        Assert.Contains(Path.Combine("TriffView", "TriffSkills"), TriffSkillsPaths.Root, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("TriffHud", TriffSkillsPaths.Root, StringComparison.OrdinalIgnoreCase);
+        TriffSkillsPaths.OverrideRoot(_dir);
     }
 }

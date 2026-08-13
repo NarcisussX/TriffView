@@ -110,8 +110,7 @@ The standalone UI uses these direct JavaScript dependencies:
 
 - React 18.3.1 - MIT License
 - React DOM 18.3.1 - MIT License
-- Vite 5.4.21 - MIT License
-- esbuild 0.21.5 - MIT License
+- Vite 8.2.1 - MIT License
 - lucide-react 0.468.0 - ISC License
 
 Transitive JavaScript dependencies are recorded in `app/package-lock.json`.
@@ -158,6 +157,10 @@ THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ```
+
+## Microsoft IdentityModel
+
+TriffView uses `System.IdentityModel.Tokens.Jwt` 8.22.0 and its Microsoft IdentityModel transitive packages to validate EVE SSO JWT signatures and claims. These packages are maintained by Microsoft, are distributed under the MIT License, and are recorded exactly in the NuGet restore assets. Source and license: https://github.com/AzureAD/azure-activedirectory-identitymodel-extensions-for-dotnet
 
 ## .NET and Windows Components
 

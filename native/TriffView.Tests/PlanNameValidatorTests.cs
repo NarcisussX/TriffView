@@ -58,9 +58,23 @@ public class PlanNameValidatorTests
     {
         var root = Path.Combine(Path.GetTempPath(), "triffskills-tests", "plans");
         Assert.True(PlanNameValidator.IsWithin(Path.Combine(root, "plan.txt"), root));
-        Assert.True(PlanNameValidator.IsWithin(root, root));
+        Assert.False(PlanNameValidator.IsWithin(root, root));
         Assert.False(PlanNameValidator.IsWithin(Path.Combine(root, "..", "escape.txt"), root));
         // A sibling whose name merely starts with the root's name is outside it.
         Assert.False(PlanNameValidator.IsWithin(root + "-sibling" + Path.DirectorySeparatorChar + "plan.txt", root));
+    }
+
+    [Fact]
+    public void RejectsMalformedUnicodeWithoutThrowing()
+    {
+        Assert.False(PlanNameValidator.TryValidate("bad\uD800name", out _, out var error));
+        Assert.Contains("Unicode", error, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void NormalizesUnicodeBeforeCollisionChecks()
+    {
+        Assert.True(PlanNameValidator.TryValidate("Cafe\u0301", out var normalized, out _));
+        Assert.Equal("Café", normalized);
     }
 }

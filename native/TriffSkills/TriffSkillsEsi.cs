@@ -2,14 +2,10 @@ using System.Text.Json.Serialization;
 
 namespace TriffView.TriffSkills;
 
-// GET /characters/{character_id}/skills/ - requires esi-skills.read_skills.v1
 internal sealed class CharacterSkillsResponse
 {
     [JsonPropertyName("skills")]
-    public List<CharacterSkill> Skills { get; set; } = new();
-
-    [JsonPropertyName("total_sp")]
-    public long TotalSp { get; set; }
+    public List<CharacterSkill> Skills { get; set; } = [];
 }
 
 internal sealed class CharacterSkill
@@ -22,13 +18,8 @@ internal sealed class CharacterSkill
 
     [JsonPropertyName("trained_skill_level")]
     public int TrainedSkillLevel { get; set; }
-
-    [JsonPropertyName("skillpoints_in_skill")]
-    public long SkillpointsInSkill { get; set; }
 }
 
-// GET /characters/{character_id}/skillqueue/ - requires esi-skills.read_skillqueue.v1.
-// The response is a bare array, so deserialize it as List<SkillQueueItem>.
 internal sealed class SkillQueueItem
 {
     [JsonPropertyName("skill_id")]
@@ -37,8 +28,6 @@ internal sealed class SkillQueueItem
     [JsonPropertyName("finished_level")]
     public int FinishedLevel { get; set; }
 
-    // ESI omits finish_date while the skill queue is paused, which is why
-    // QueueEntry.FinishDate is nullable and a fully-queued plan can have no ETA.
     [JsonPropertyName("finish_date")]
     public DateTimeOffset? FinishDate { get; set; }
 
@@ -49,12 +38,10 @@ internal sealed class SkillQueueItem
     public int QueuePosition { get; set; }
 }
 
-// POST /universe/ids/ returns one array per resolved category; skills come back
-// under "inventory_types".
 internal sealed class SkillsUniverseIdsResponse
 {
     [JsonPropertyName("inventory_types")]
-    public List<SkillsUniverseIdName> InventoryTypes { get; set; } = new();
+    public List<SkillsUniverseIdName> InventoryTypes { get; set; } = [];
 }
 
 internal sealed class SkillsUniverseIdName
@@ -63,37 +50,45 @@ internal sealed class SkillsUniverseIdName
     public int Id { get; set; }
 
     [JsonPropertyName("name")]
-    public string Name { get; set; } = "";
+    public string Name { get; set; } = string.Empty;
 }
+
+internal sealed class UniverseTypeResponse
+{
+    [JsonPropertyName("group_id")]
+    public int GroupId { get; set; }
+}
+
+internal sealed class UniverseGroupResponse
+{
+    [JsonPropertyName("category_id")]
+    public int CategoryId { get; set; }
+}
+
+internal sealed record SkillSnapshot(
+    IReadOnlyDictionary<int, int> ActiveLevels,
+    IReadOnlyDictionary<int, int> TrainedLevels);
 
 internal static class EsiSkillMapper
 {
-    public static Dictionary<int, int> ToTrainedLevels(CharacterSkillsResponse? response)
+    public static SkillSnapshot ToSnapshot(CharacterSkillsResponse? response)
     {
-        var levels = new Dictionary<int, int>();
-        foreach (var skill in response?.Skills ?? new List<CharacterSkill>())
+        var active = new Dictionary<int, int>();
+        var trained = new Dictionary<int, int>();
+        foreach (var skill in response?.Skills ?? [])
         {
             if (skill.SkillId <= 0) continue;
-
-            // active_skill_level, deliberately, not trained_skill_level. An alpha clone
-            // can hold SP for level 4 in a skill its clone state caps at 2; active is
-            // what the character can actually use, which is what "can it fly X" means.
-            levels[skill.SkillId] = skill.ActiveSkillLevel;
+            active[skill.SkillId] = Math.Clamp(skill.ActiveSkillLevel, 0, 5);
+            trained[skill.SkillId] = Math.Clamp(skill.TrainedSkillLevel, 0, 5);
         }
-
-        return levels;
+        return new SkillSnapshot(active, trained);
     }
 
     public static List<QueueEntry> ToQueue(IReadOnlyList<SkillQueueItem>? items)
-    {
-        var queue = new List<QueueEntry>();
-        var ordered = (items ?? Array.Empty<SkillQueueItem>()).OrderBy(item => item.QueuePosition);
-        foreach (var item in ordered)
-        {
-            if (item.SkillId <= 0) continue;
-            queue.Add(new QueueEntry(item.SkillId, item.FinishedLevel, item.FinishDate));
-        }
-
-        return queue;
-    }
+        => (items ?? [])
+            .Where(item => item.SkillId > 0 && item.FinishedLevel is >= 1 and <= 5)
+            .OrderBy(item => item.QueuePosition)
+            .Take(500)
+            .Select(item => new QueueEntry(item.SkillId, item.FinishedLevel, item.StartDate, item.FinishDate, item.QueuePosition))
+            .ToList();
 }

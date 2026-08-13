@@ -7,89 +7,72 @@ public class SkillPlanParserTests
 {
     [Theory]
     [InlineData("Navigation I", 1)]
-    [InlineData("Navigation II", 2)]
-    [InlineData("Navigation III", 3)]
-    [InlineData("Navigation IV", 4)]
-    [InlineData("Navigation V", 5)]
-    [InlineData("Navigation iv", 4)] // Roman levels are case-insensitive
-    public void ParsesRomanLevels(string line, int expected)
+    [InlineData("Navigation iv", 4)]
+    [InlineData("Navigation 5", 5)]
+    [InlineData("Survey\tIII", 3)]
+    [InlineData("Survey\u00A0II", 2)]
+    public void ParsesSupportedNativeLines(string line, int expected)
     {
-        var plan = SkillPlanParser.Parse("p", line);
-        var requirement = Assert.Single(plan.Requirements);
-        Assert.Equal("Navigation", requirement.SkillName);
+        var result = SkillPlanParser.Parse("p", line);
+        Assert.True(result.IsValid);
+        var requirement = Assert.Single(result.Plan!.Requirements);
         Assert.Equal(expected, requirement.Level);
     }
 
     [Theory]
-    [InlineData("Gunnery 1", 1)]
-    [InlineData("Gunnery 5", 5)]
-    public void ParsesNumericLevelsOneThroughFive(string line, int expected)
-    {
-        var plan = SkillPlanParser.Parse("p", line);
-        Assert.Equal(expected, Assert.Single(plan.Requirements).Level);
-    }
-
-    [Theory]
-    [InlineData("Gunnery 0")]
-    [InlineData("Gunnery 6")]
-    [InlineData("Gunnery 50")]
-    [InlineData("Gunnery -1")]
     [InlineData("Gunnery")]
-    public void RejectsLevelsOutsideOneThroughFive(string line)
+    [InlineData("Gunnery 0")]
+    [InlineData("Gunnery VI")]
+    [InlineData("Gunnery -1")]
+    [InlineData("just words here")]
+    public void EveryMalformedNonCommentLineRejectsThePlan(string line)
     {
-        Assert.Empty(SkillPlanParser.Parse("p", line).Requirements);
+        var result = SkillPlanParser.Parse("p", $"Navigation V\n{line}\n");
+        Assert.False(result.IsValid);
+        Assert.Null(result.Plan);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Line == 2);
     }
 
-    // Escapes rather than literal characters: a raw tab or non-breaking space in the
-    // source is invisible in review and easy to "fix" into a plain space by accident.
-    [Theory]
-    [InlineData("Survey\tIV")]
-    [InlineData("Survey\u00A0IV")]
-    [InlineData("Survey \u00A0 IV")]
-    public void SplitsOnNonAsciiWhitespace(string line)
+    [Fact]
+    public void MergesDuplicatesAtHighestLevelAndKeepsFirstCasing()
     {
-        var requirement = Assert.Single(SkillPlanParser.Parse("p", line).Requirements);
+        var result = SkillPlanParser.Parse("p", "Survey 3\nsurvey IV\nSURVEY 2");
+        var requirement = Assert.Single(result.Plan!.Requirements);
         Assert.Equal("Survey", requirement.SkillName);
         Assert.Equal(4, requirement.Level);
     }
 
     [Fact]
-    public void TrimsColumnAlignedWhitespaceFromName()
+    public void CommentsBlankLinesAndCrlfAreAccepted()
     {
-        var plan = SkillPlanParser.Parse("p", "Survey    IV");
-        Assert.Equal("Survey", Assert.Single(plan.Requirements).SkillName);
+        var result = SkillPlanParser.Parse("p", "# comment\r\n\r\nNavigation V\r\nGunnery 3\r\n");
+        Assert.True(result.IsValid);
+        Assert.Equal(2, result.Plan!.Requirements.Count);
     }
 
     [Fact]
-    public void MergesDuplicatesCaseInsensitivelyKeepingHighestLevel()
+    public void EmptyOrCommentOnlyPlanIsRejected()
     {
-        var plan = SkillPlanParser.Parse("p", "Survey 3\nsurvey 4\nSURVEY 2");
-        var requirement = Assert.Single(plan.Requirements);
-        Assert.Equal("Survey", requirement.SkillName); // first-seen casing wins
-        Assert.Equal(4, requirement.Level);
+        var result = SkillPlanParser.Parse("p", "# no requirements\n");
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Line == 0);
     }
 
     [Fact]
-    public void SkipsBlankAndCommentLines()
+    public void EnforcesContentLineAndRequirementLimits()
     {
-        var contents = "# a comment ending in a digit 3\n\n   \nNavigation V\n# another\r\n";
-        var plan = SkillPlanParser.Parse("p", contents);
-        Assert.Equal("Navigation", Assert.Single(plan.Requirements).SkillName);
+        Assert.False(SkillPlanParser.Parse("p", new string('x', SkillPlanParser.MaxContentCharacters + 1)).IsValid);
+        Assert.False(SkillPlanParser.Parse("p", string.Join('\n', Enumerable.Repeat("#", SkillPlanParser.MaxLines + 1))).IsValid);
+        Assert.False(SkillPlanParser.Parse("p", new string('x', SkillPlanParser.MaxLineCharacters + 1) + " I").IsValid);
+        var tooMany = string.Join('\n', Enumerable.Range(1, SkillPlanParser.MaxRequirements + 1).Select(index => $"Skill {index} I"));
+        Assert.False(SkillPlanParser.Parse("p", tooMany).IsValid);
     }
 
     [Fact]
-    public void HandlesCrlfContent()
+    public void RejectsMalformedUnicodeSkillNames()
     {
-        var plan = SkillPlanParser.Parse("p", "Navigation V\r\nGunnery 3\r\n");
-        Assert.Equal(2, plan.Requirements.Count);
-        Assert.Equal("Navigation", plan.Requirements[0].SkillName);
-        Assert.Equal("Gunnery", plan.Requirements[1].SkillName);
-    }
-
-    [Fact]
-    public void AllInvalidLinesYieldZeroRequirements()
-    {
-        var plan = SkillPlanParser.Parse("p", "# only a comment\nnot a requirement\nGunnery 9");
-        Assert.Empty(plan.Requirements);
+        var result = SkillPlanParser.Parse("p", "Bad\uD800Skill I");
+        Assert.False(result.IsValid);
+        Assert.Contains(result.Diagnostics, diagnostic => diagnostic.Message.Contains("Unicode", StringComparison.Ordinal));
     }
 }
