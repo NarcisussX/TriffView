@@ -44,15 +44,17 @@ Fleet Manager does not control EVE clients. It does not inject keyboard input, m
 
 ## TriffSkills Included
 
-TriffSkills shows which local skill plans your characters can already fly. Authenticate a character through EVE SSO, and TriffSkills reads active levels, trained levels, and the skill queue through ESI. The matrix distinguishes Ready, Training, Trained but inactive, Missing, Unknown, and Not scored. Ready means every required level is currently active; a trained but inactive alpha-restricted level is not reported as ready.
+## TriffSkills Included
 
-Plans are local plain-text files: one skill per line, name then level (`Navigation V`). Paste text into Import local plan, review the native validation preview, then explicitly confirm the save. Malformed non-comment lines reject the whole import instead of being silently skipped. You can also place `.txt` files in `%APPDATA%\TriffView\TriffSkills\plans`; Open plans folder takes you there and Reload plans picks up changes without restarting. One starter plan, Core Ship Skills, is written only when the plans directory is first created.
+Checking a skill plan across 10, 20, or 30 characters should not mean opening 10, 20, or 30 character sheets. TriffSkills puts every authenticated character and every local skill plan into one matrix, so you can immediately see who is ready, who is training, and who still has work to do.
 
-TriffSkills uses the same EVE application registration as Fleet Manager, but its own consent and Credential Manager namespace. Its login asks for `esi-skills.read_skills.v1` and `esi-skills.read_skillqueue.v1` and nothing else. A debug build can use `TRIFFVIEW_TRIFFSKILLS_CLIENT_ID` for development; release builds always use the registered built-in client ID.
+The boxes fill as more of the plan is trained and change color based on what is holding the character back. Ready means every required skill is currently active, Training means the remaining requirements are already in the queue, and Locked catches skills that are trained but unavailable on the character’s current clone. Click any character, plan, or individual result to see the full breakdown, including missing skills, queued requirements, active and trained levels, and an ETA when EVE provides one.
 
-Refresh tokens are stored in Windows Credential Manager under `TriffView.TriffSkills.RefreshToken.<character-id>`. Fleet Manager tokens remain under `TriffView.TriffFleets.RefreshToken.<character-id>`. Access tokens exist only in process memory and are discarded when TriffView exits. The local JSON cache contains character identity metadata, granted scope names, active/trained skill levels, queue timing, and the last successful fetch time; it never contains access or refresh tokens. Forget deletes the TriffSkills credential and then removes that character's local row. If a refresh fails temporarily, the last-good snapshot remains visible and is labelled with the error rather than being replaced with empty data.
+Skill plans are simple `.txt` files using the same format EVE uses: one skill per line, such as `Navigation V`. Paste a plan into the importer, review exactly what TriffSkills validated, then save it locally. You can also add, edit, share, or remove plans directly from the plans folder and reload them without restarting TriffView.
 
-TriffSkills is read-only. It does not train skills, buy skill injectors, change your queue, or control EVE clients.
+Characters are authenticated through official EVE SSO, and TriffView never sees your EVE password. TriffSkills only requests permission to read skills and the skill queue. Refresh tokens are stored in Windows Credential Manager, separately from Fleet Manager, while access tokens only exist in memory. If ESI goes down or a refresh fails, your last successful data stays visible and is clearly marked stale instead of disappearing.
+
+TriffSkills is completely read-only. It cannot train skills, change your queue, buy injectors, control an EVE client, or perform any other action on your character.
 
 ## TriffAlerts Included
 
