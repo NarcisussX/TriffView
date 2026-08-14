@@ -34,6 +34,20 @@ internal static class ScreenGeometry
         return Forms.Screen.PrimaryScreen?.Bounds ?? Forms.SystemInformation.VirtualScreen;
     }
 
+    public static IReadOnlyList<ScreenPixelInfo> MonitorTopologyPixels()
+    {
+        var screens = Forms.Screen.AllScreens;
+        if (screens.Length == 0)
+        {
+            return new[] { new ScreenPixelInfo("VirtualScreen", true, Forms.SystemInformation.VirtualScreen) };
+        }
+
+        return screens
+            .Select(screen => new ScreenPixelInfo(screen.DeviceName, screen.Primary, screen.Bounds))
+            .OrderBy(screen => screen.DeviceName, StringComparer.OrdinalIgnoreCase)
+            .ToArray();
+    }
+
     public static Rect PrimaryScreenDips(Visual visual)
     {
         return DeviceRectToDips(visual, PrimaryScreenPixels());
@@ -88,4 +102,5 @@ internal static class ScreenGeometry
         return new Rect(topLeft, bottomRight);
     }
 }
+    internal readonly record struct ScreenPixelInfo(string DeviceName, bool Primary, Drawing.Rectangle Bounds);
     public sealed record ScreenDipInfo(string DeviceName, string Label, bool Primary, Rect Bounds);

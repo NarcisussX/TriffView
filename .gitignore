@@ -17,6 +17,8 @@ pnpm-debug.log*
 /native/obj/
 /native/TriffView.Tests/bin/
 /native/TriffView.Tests/obj/
+/native/TriffView.PreviewPositionTests/bin/
+/native/TriffView.PreviewPositionTests/obj/
 /native/Assets/overlay-dist.zip
 /tests/**/bin/
 /tests/**/obj/

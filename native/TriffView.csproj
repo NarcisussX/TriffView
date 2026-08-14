@@ -29,6 +29,9 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="TriffView.Tests" />
+    <InternalsVisibleTo Include="TriffView.CycleTests" />
+    <InternalsVisibleTo Include="TriffView.PreviewPositionTests" />
+    <Compile Remove="TriffView.PreviewPositionTests\**\*.cs" />
   </ItemGroup>
 
   <ItemGroup>
