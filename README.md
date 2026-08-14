@@ -26,6 +26,7 @@ TriffView is a standalone preview system paired with configurable log alerts, a 
 - EVE-X Preview JSON import.
 - Full TriffView settings backup export and restore.
 - Fleet Manager for saving wing/squad layouts, pre-assigning characters, restructuring live fleets, moving existing members, and sending ESI invites.
+- TriffSkills for scoring your authenticated characters against local skill plans, with the skills each one still needs.
 - Dark themed standalone settings window with selectable GUI themes.
 - Tray controls for quick enable, disable, suspend, save, restore, reload, and quit actions.
 
@@ -40,6 +41,18 @@ TriffFleets lets you save fleet wing/squad names, pre-assign characters and role
 Build repeatable fleet templates for DPS, logi, scouts, miners, rolling crews, or whatever your multiboxing setup needs. Create the fleet in-game, detect it with the authenticated fleet boss, then let TriffFleets create or rename wings and squads, move existing members into their saved positions, invite missing characters, keep unexpected pilots in a Bench / Waiting squad, and show a clear result log for every action.
 
 Fleet Manager does not control EVE clients. It does not inject keyboard input, mouse input, chat commands, OCR, memory reads, warps, modules, or invite acceptance. Characters still accept fleet invites manually in-game.
+
+## TriffSkills Included
+
+Checking a skill plan across 10, 20, or 30 characters should not mean opening 10, 20, or 30 character sheets. TriffSkills puts every authenticated character and every local skill plan into one matrix, so you can immediately see who is ready, who is training, and who still has work to do.
+
+The boxes fill as more of the plan is trained and change color based on what is holding the character back. Ready means every required skill is currently active, Training means the remaining requirements are already in the queue, and Locked catches skills that are trained but unavailable on the character’s current clone. Click any character, plan, or individual result to see the full breakdown, including missing skills, queued requirements, active and trained levels, and an ETA when EVE provides one.
+
+Skill plans are simple `.txt` files using the same format EVE uses: one skill per line, such as `Navigation V`. Paste a plan into the importer, review exactly what TriffSkills validated, then save it locally. You can also add, edit, share, or remove plans directly from the plans folder and reload them without restarting TriffView.
+
+Characters are authenticated through official EVE SSO, and TriffView never sees your EVE password. TriffSkills only requests permission to read skills and the skill queue. Refresh tokens are stored in Windows Credential Manager, separately from Fleet Manager, while access tokens only exist in memory. If ESI goes down or a refresh fails, your last successful data stays visible and is clearly marked stale instead of disappearing.
+
+TriffSkills is completely read-only. It cannot train skills, change your queue, buy injectors, control an EVE client, or perform any other action on your character.
 
 ## TriffAlerts Included
 
@@ -91,3 +104,4 @@ The release executable is Authenticode signed by Cooper Broderick and timestampe
 - [EVE-MultiPreview](https://github.com/CJKondur/EVE-MultiPreview) for the alerts idea.
 - [EVE Settings Manager](https://github.com/mintnick/eve-settings-manager) for the EVE settings management idea.
 - [Yeramel](https://www.youtube.com/@Yeramel) for the fleet management tool idea.
+- [guarzo](https://github.com/guarzo) for the Skill Planner inspiration based on CanIFly.

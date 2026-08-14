@@ -18,10 +18,17 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <Compile Remove="TriffView.Tests\**" />
+    <None Remove="TriffView.Tests\**" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IdentityModel.Tokens.Jwt" Version="8.22.0" />
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.2792.45" />
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="TriffView.Tests" />
     <InternalsVisibleTo Include="TriffView.CycleTests" />
     <InternalsVisibleTo Include="TriffView.PreviewPositionTests" />
     <Compile Remove="TriffView.PreviewPositionTests\**\*.cs" />

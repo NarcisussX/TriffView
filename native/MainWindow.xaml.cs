@@ -107,6 +107,7 @@ public partial class MainWindow : Window
 {
     private const string VirtualHostName = "app.triffview.local";
     private const string EmbeddedOverlayResourceName = "TriffView.Assets.overlay-dist.zip";
+    private const int MaxWebMessageCharacters = 1_200_000;
     private static readonly JsonSerializerOptions WebMessageJsonOptions = new()
     {
         PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
@@ -135,6 +136,9 @@ public partial class MainWindow : Window
     private TriffViewController? _triffView;
     private EveSettingsController? _eveSettings;
     private TriffFleetsController? _triffFleets;
+    private TriffSkills.TriffSkillsController? _triffSkills;
+    private WebViewTrustPolicy? _webViewTrust;
+    private bool _allowMissingPageNavigation;
     private InputOverlayWindow? _inputOverlay;
     private GuiThemePalette _guiTheme = GuiThemePalette.TriffTools;
     private TriffViewUpdateSnapshot _updateSnapshot;
@@ -257,6 +261,7 @@ public partial class MainWindow : Window
         var openTriffViewItem = new Forms.ToolStripMenuItem("Open TriffView settings", null, (_, _) => OpenTool("triffview"));
         var openEveSettingsItem = new Forms.ToolStripMenuItem("Open EVE Settings", null, (_, _) => OpenTool("eve-settings"));
         var openFleetManagerItem = new Forms.ToolStripMenuItem("Open Fleet Manager", null, (_, _) => OpenTool("fleet-manager"));
+        var openSkillPlannerItem = new Forms.ToolStripMenuItem("Open Skill Planner", null, (_, _) => OpenTool("skill-planner"));
         var savePreviewItem = new Forms.ToolStripMenuItem("Save preview positions", null, (_, _) => PostTriffViewNativeCommand("save-preview-layout"));
         var saveClientsItem = new Forms.ToolStripMenuItem("Save EVE client positions", null, (_, _) => PostTriffViewNativeCommand("save-client-layouts"));
         var restoreClientsItem = new Forms.ToolStripMenuItem("Restore EVE client positions", null, (_, _) => PostTriffViewNativeCommand("restore-client-layouts"));
@@ -275,6 +280,7 @@ public partial class MainWindow : Window
         menu.Items.Add(openTriffViewItem);
         menu.Items.Add(openEveSettingsItem);
         menu.Items.Add(openFleetManagerItem);
+        menu.Items.Add(openSkillPlannerItem);
         menu.Items.Add(new Forms.ToolStripSeparator());
         menu.Items.Add(_triffViewEnabledItem);
         menu.Items.Add(_triffViewHotkeysItem);
@@ -389,13 +395,16 @@ public partial class MainWindow : Window
         );
         await AppWebView.EnsureCoreWebView2Async(webViewEnvironment);
 
+        var devUrl = GetDevUrl();
+        _webViewTrust = new WebViewTrustPolicy(VirtualHostName, devUrl);
         AppWebView.CoreWebView2.Settings.AreDefaultContextMenusEnabled = false;
         AppWebView.CoreWebView2.Settings.AreDevToolsEnabled = false;
         AppWebView.CoreWebView2.ScriptDialogOpening += OnScriptDialogOpening;
         AppWebView.CoreWebView2.WebMessageReceived += OnWebMessageReceived;
+        AppWebView.CoreWebView2.NavigationStarting += OnNavigationStarting;
+        AppWebView.CoreWebView2.NewWindowRequested += OnNewWindowRequested;
         AppWebView.CoreWebView2.NavigationCompleted += (_, _) => PostAppSettings();
 
-        var devUrl = GetDevUrl();
         if (!string.IsNullOrWhiteSpace(devUrl))
         {
             AppWebView.Source = new Uri(devUrl);
@@ -405,6 +414,7 @@ public partial class MainWindow : Window
         var distFolder = FindOverlayDistFolder();
         if (distFolder == null)
         {
+            _allowMissingPageNavigation = true;
             AppWebView.NavigateToString(MissingOverlayHtml());
             return;
         }
@@ -412,9 +422,32 @@ public partial class MainWindow : Window
         AppWebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
             VirtualHostName,
             distFolder,
-            CoreWebView2HostResourceAccessKind.Allow
+            CoreWebView2HostResourceAccessKind.Deny
         );
         AppWebView.Source = new Uri($"https://{VirtualHostName}/index.html");
+    }
+
+    private void OnNavigationStarting(object? sender, CoreWebView2NavigationStartingEventArgs e)
+    {
+        if (_allowMissingPageNavigation && string.Equals(e.Uri, "about:blank", StringComparison.OrdinalIgnoreCase))
+        {
+            _allowMissingPageNavigation = false;
+            return;
+        }
+
+        var decision = _webViewTrust?.ClassifyNavigation(e.Uri) ?? WebViewNavigationKind.Rejected;
+        if (decision == WebViewNavigationKind.Internal) return;
+        e.Cancel = true;
+        if (decision == WebViewNavigationKind.External && e.IsUserInitiated) OpenExternal(e.Uri);
+    }
+
+    private void OnNewWindowRequested(object? sender, CoreWebView2NewWindowRequestedEventArgs e)
+    {
+        e.Handled = true;
+        if (e.IsUserInitiated && _webViewTrust?.ClassifyNavigation(e.Uri) == WebViewNavigationKind.External)
+        {
+            OpenExternal(e.Uri);
+        }
     }
 
     private void OnScriptDialogOpening(object? sender, CoreWebView2ScriptDialogOpeningEventArgs e)
@@ -445,11 +478,15 @@ public partial class MainWindow : Window
 
     private string? GetDevUrl()
     {
+#if DEBUG
         var envUrl = Environment.GetEnvironmentVariable("TRIFFVIEW_DEV_URL");
         if (!string.IsNullOrWhiteSpace(envUrl)) return envUrl;
         return _args.Any(arg => string.Equals(arg, "--dev", StringComparison.OrdinalIgnoreCase))
             ? "http://localhost:5178"
             : null;
+#else
+        return null;
+#endif
     }
 
     private static string? FindOverlayDistFolder()
@@ -604,18 +641,21 @@ public partial class MainWindow : Window
 
     private void OnWebMessageReceived(object? sender, CoreWebView2WebMessageReceivedEventArgs e)
     {
+        if (_webViewTrust?.IsBridgeSource(e.Source) != true) return;
         JsonObject? message;
         try
         {
-            message = JsonNode.Parse(e.WebMessageAsJson)?.AsObject();
+            var json = e.WebMessageAsJson;
+            if (json.Length > MaxWebMessageCharacters) return;
+            message = JsonNode.Parse(json)?.AsObject();
         }
         catch
         {
             return;
         }
 
-        var type = message?["type"]?.GetValue<string>();
-        if (string.IsNullOrWhiteSpace(type)) return;
+        var type = message?["type"] is JsonValue value && value.TryGetValue<string>(out var parsedType) ? parsedType : string.Empty;
+        if (string.IsNullOrWhiteSpace(type) || type.Length > 128) return;
 
         if (_triffView?.HandleWebMessage(type, message) == true)
         {
@@ -633,16 +673,40 @@ public partial class MainWindow : Window
             return;
         }
 
+        if (type.StartsWith("triffskills:", StringComparison.Ordinal))
+        {
+            try
+            {
+                _triffSkills ??= new TriffSkills.TriffSkillsController(PostAppEvent);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Failed to initialize Skill Planner: {ex}");
+                PostAppEvent(new
+                {
+                    type = "triffskills:error",
+                    action = "initialize",
+                    message = "Skill Planner could not be initialized.",
+                });
+                return;
+            }
+
+            if (_triffSkills.HandleWebMessage(type, message))
+            {
+                return;
+            }
+        }
+
         switch (type)
         {
             case "hide":
                 HideSettings();
                 break;
             case "open-external":
-                OpenExternal(message?["url"]?.GetValue<string>());
+                OpenExternal(ReadBridgeString(message, "url", 2_048));
                 break;
             case "copy-text":
-                CopyText(message?["text"]?.GetValue<string>());
+                CopyText(ReadBridgeString(message, "text", MaxWebMessageCharacters));
                 break;
             case "read-clipboard":
                 ReadClipboard();
@@ -660,7 +724,7 @@ public partial class MainWindow : Window
                 OpenUpdateRelease();
                 break;
             case "update:ignore-version":
-                IgnoreUpdateVersion(message?["version"]?.GetValue<string>());
+                IgnoreUpdateVersion(ReadBridgeString(message, "version", 64));
                 break;
             case "settings:get":
             case "standalone:ready":
@@ -669,6 +733,11 @@ public partial class MainWindow : Window
                 break;
         }
     }
+
+    private static string ReadBridgeString(JsonObject? message, string key, int maxLength)
+        => message?[key] is JsonValue value && value.TryGetValue<string>(out var text)
+            ? text[..Math.Min(text.Length, maxLength)]
+            : string.Empty;
 
     private void ApplyStandaloneTheme(JsonObject? theme)
     {
@@ -816,6 +885,7 @@ public partial class MainWindow : Window
         if (string.IsNullOrWhiteSpace(url)) return;
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri)) return;
         if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return;
+        if (!string.IsNullOrEmpty(uri.UserInfo)) return;
 
         Process.Start(new ProcessStartInfo(uri.AbsoluteUri)
         {
@@ -1085,6 +1155,18 @@ public partial class MainWindow : Window
         {
             _triffView.Dispose();
             _triffView = null;
+        }
+
+        if (_triffSkills != null)
+        {
+            _triffSkills.Dispose();
+            _triffSkills = null;
+        }
+
+        if (_triffFleets != null)
+        {
+            _triffFleets.Dispose();
+            _triffFleets = null;
         }
 
         if (_inputOverlay != null)

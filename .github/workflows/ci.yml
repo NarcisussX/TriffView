@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: "22.17.1"
+          package-manager-cache: false
+
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: app
+
+      - name: Audit web dependencies
+        run: npm audit --audit-level=low
+        working-directory: app
+
+      - name: Build web UI
+        run: npm run build
+        working-directory: app
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@26b0ec14cb23fa6904739307f278c14f94c95bf1
+        with:
+          dotnet-version: "8.0.421"
+
+      - name: Restore .NET dependencies
+        run: dotnet restore native/TriffView.Tests/TriffView.Tests.csproj --warnaserror -p:NuGetAudit=true -p:NuGetAuditMode=all -p:NuGetAuditLevel=moderate
+
+      - name: Build native app and tests
+        run: dotnet build native/TriffView.Tests/TriffView.Tests.csproj --configuration Release --no-restore --warnaserror
+
+      - name: Run native tests
+        run: dotnet test native/TriffView.Tests/TriffView.Tests.csproj --configuration Release --no-restore --no-build
+
+      - name: Run alert regression harness
+        run: dotnet run --project tests/TriffAlerts.Tests/TriffAlerts.Tests.csproj --configuration Release
