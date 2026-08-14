@@ -22,6 +22,12 @@
   </ItemGroup>
 
   <ItemGroup>
+    <InternalsVisibleTo Include="TriffView.CycleTests" />
+    <InternalsVisibleTo Include="TriffView.PreviewPositionTests" />
+    <Compile Remove="TriffView.PreviewPositionTests\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Resource Include="Assets\TriffView.ico" />
     <EmbeddedResource Include="Assets\overlay-dist.zip"
                       Condition="Exists('Assets\overlay-dist.zip')"

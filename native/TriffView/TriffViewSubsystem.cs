@@ -46,6 +46,7 @@ internal sealed class TriffViewController : IDisposable
     private int _periodicRefreshInProgress;
     private string _lastClientTopologySignature = "";
     private string _lastClientStateSignature = "";
+    private readonly Dictionary<string, nint> _cycleGroupCursors = new(StringComparer.OrdinalIgnoreCase);
     private nint _foregroundWinEventHook;
     private bool _hasObservedForeground;
     private bool _lastObservedForegroundWasEve;
@@ -359,8 +360,11 @@ internal sealed class TriffViewController : IDisposable
             _activeClientHandle = foreground;
         }
 
-        if (_activeClientHandle != nint.Zero && clients.All(client => client.Handle != _activeClientHandle))
+        if (_activeClientHandle != nint.Zero
+            && clients.All(client => client.Handle != _activeClientHandle)
+            && !TriffViewNativeMethods.IsWindow(_activeClientHandle))
         {
+            RemoveCycleCursorHandle(_activeClientHandle);
             _activeClientHandle = nint.Zero;
         }
 
@@ -371,7 +375,9 @@ internal sealed class TriffViewController : IDisposable
 
         var topologySignature = ClientTopologySignature(clients);
         var stateSignature = ClientStateSignature(clients, foreground);
-        var topologyChanged = forceFullRefresh || !string.Equals(topologySignature, _lastClientTopologySignature, StringComparison.Ordinal);
+        var topologyChanged = forceFullRefresh
+            || !string.Equals(topologySignature, _lastClientTopologySignature, StringComparison.Ordinal)
+            || _overlay.HasPositionContextChanged(profile);
         var stateChanged = !string.Equals(stateSignature, _lastClientStateSignature, StringComparison.Ordinal);
 
         _clients = clients;
@@ -441,15 +447,21 @@ internal sealed class TriffViewController : IDisposable
     {
         if (_disposed) return;
 
+        var liveForeground = TriffViewNativeMethods.GetForegroundWindow();
+        if (foreground != liveForeground) return;
+
         var foregroundIsEve = clients.Any(client => client.Handle == foreground);
         var returnedToEve = _hasObservedForeground && !_lastObservedForegroundWasEve && foregroundIsEve;
         _hasObservedForeground = true;
         _lastObservedForegroundWasEve = foregroundIsEve;
 
-        if (!returnedToEve || !Settings.Enabled || !_overlay.Visible) return;
+        if (!foregroundIsEve || !Settings.Enabled || !_overlay.Visible) return;
 
         _activeClientHandle = foreground;
         _overlay.MarkActiveClient(foreground);
+        RememberCycleCursorForActiveGroups(Settings.ActiveProfileFast(), foreground);
+        if (!returnedToEve) return;
+
         ApplyTopmostPolicy(force: true);
         _reassertHudTopmost();
     }
@@ -482,17 +494,18 @@ internal sealed class TriffViewController : IDisposable
 
     private void ActivateClient(EveClientWindow client)
     {
-        ActivateClient(client, Settings.ActiveProfileFast());
+        TryActivateClient(client, Settings.ActiveProfileFast());
     }
 
-    private void ActivateClient(EveClientWindow client, TriffViewProfile profile)
+    private bool TryActivateClient(EveClientWindow client, TriffViewProfile profile)
     {
         try
         {
             var previousClient = ResolvePreviousActiveClient(client.Handle);
-            if (!ActivateWindow(client, profile)) return;
+            if (!ActivateWindow(client, profile)) return false;
 
             _activeClientHandle = client.Handle;
+            RememberCycleCursorForActiveGroups(profile, client.Handle);
             MarkActiveClient(client.Handle);
 
             if (ShouldMinimizePreviousClient(profile, previousClient, client.Handle))
@@ -505,10 +518,13 @@ internal sealed class TriffViewController : IDisposable
                 SendMinimizeClient(previousClient!.Handle);
                 ActivateWindow(client, profile);
             }
+
+            return true;
         }
         catch (Exception ex)
         {
             PostError("activate", ex.Message);
+            return false;
         }
     }
 
@@ -687,7 +703,7 @@ internal sealed class TriffViewController : IDisposable
             var target = _clients.FirstOrDefault(client => characterNames.Any(characterName =>
                 string.Equals(client.CharacterName, characterName, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(client.StableKey, characterName, StringComparison.OrdinalIgnoreCase)));
-            if (target != null) ActivateClient(target, profile);
+            if (target != null) TryActivateClient(target, profile);
             return;
         }
 
@@ -706,15 +722,59 @@ internal sealed class TriffViewController : IDisposable
         var candidates = ResolveCycleCandidates(cycleNames);
         if (candidates.Count == 0) return;
 
-        var activeIndex = candidates.FindIndex(client => client.Handle == _activeClientHandle);
-        if (activeIndex < 0)
+        var cursorKey = CycleCursorKey(profile.Id, group?.Id ?? groupId);
+        _cycleGroupCursors.TryGetValue(cursorKey, out var cursorHandle);
+        var liveForeground = TriffViewNativeMethods.GetForegroundWindow();
+        var nextIndex = TriffViewCycleState.NextIndex(
+            candidates.Select(client => client.Handle).ToArray(),
+            direction,
+            _activeClientHandle,
+            liveForeground,
+            cursorHandle);
+        if (nextIndex < 0) return;
+
+        var target = candidates[nextIndex];
+        var previousCursor = cursorHandle;
+        _cycleGroupCursors[cursorKey] = target.Handle;
+        if (TryActivateClient(target, profile)) return;
+
+        if (previousCursor != nint.Zero && candidates.Any(client => client.Handle == previousCursor))
         {
-            activeIndex = candidates.FindIndex(client => client.IsForeground);
+            _cycleGroupCursors[cursorKey] = previousCursor;
         }
-        var nextIndex = activeIndex < 0
-            ? 0
-            : (activeIndex + direction + candidates.Count) % candidates.Count;
-        ActivateClient(candidates[nextIndex], profile);
+        else
+        {
+            _cycleGroupCursors.Remove(cursorKey);
+        }
+    }
+
+    private void RememberCycleCursorForActiveGroups(TriffViewProfile profile, nint handle)
+    {
+        if (handle == nint.Zero) return;
+
+        foreach (var group in profile.ActiveCycleGroups())
+        {
+            var cycleNames = group.Characters.Count > 0 ? group.Characters : profile.CharacterOrder;
+            if (cycleNames.Count == 0) continue;
+            if (ResolveCycleCandidates(cycleNames).All(client => client.Handle != handle)) continue;
+            _cycleGroupCursors[CycleCursorKey(profile.Id, group.Id)] = handle;
+        }
+    }
+
+    private void RemoveCycleCursorHandle(nint handle)
+    {
+        foreach (var key in _cycleGroupCursors
+                     .Where(item => item.Value == handle)
+                     .Select(item => item.Key)
+                     .ToArray())
+        {
+            _cycleGroupCursors.Remove(key);
+        }
+    }
+
+    private static string CycleCursorKey(string profileId, string groupId)
+    {
+        return $"{profileId}\u001f{groupId}";
     }
 
     private List<EveClientWindow> ResolveCycleCandidates(IReadOnlyList<string> cycleNames)
@@ -2004,6 +2064,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     private const int ResizeHitSize = 16;
     private const int DragThreshold = 4;
     private readonly Dictionary<nint, PreviewState> _previews = new();
+    private readonly TriffViewPreviewPositionMemory _positionMemory = new();
     private readonly Dictionary<int, TriffViewHotkeyCommand> _hotkeys = new();
     private readonly Forms.Timer _alertTimer = new() { Interval = 80 };
     private readonly TriffViewLabelOverlayForm _labelOverlay = new();
@@ -2110,12 +2171,30 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
         var highlightHandle = activeHandle != nint.Zero ? activeHandle : foreground;
         DwmAvailable = TriffViewNativeMethods.DwmIsCompositionEnabled(out var compositionEnabled) == 0 && compositionEnabled;
-        var desiredHandles = clients
+        var liveIdentities = clients
+            .Select(PreviewClientIdentity.From)
+            .ToHashSet();
+        var memoryInvalidated = _positionMemory.BeginContext(
+            profile.Id,
+            profile.PreviewWidth,
+            profile.PreviewHeight,
+            ScreenGeometry.MonitorTopologyPixels());
+        if (!memoryInvalidated)
+        {
+            foreach (var state in _previews.Values.Where(state => liveIdentities.Contains(state.Identity)))
+            {
+                _positionMemory.Remember(state.Identity, state.FrameRect);
+            }
+        }
+
+        _positionMemory.PurgeExcept(liveIdentities);
+
+        var visibleIdentities = clients
             .Where(client => !(profile.HideActivePreview && client.Handle == highlightHandle))
-            .Select(client => client.Handle)
+            .Select(PreviewClientIdentity.From)
             .ToHashSet();
 
-        foreach (var handle in _previews.Keys.Where(handle => !desiredHandles.Contains(handle)).ToArray())
+        foreach (var handle in _previews.Keys.Where(handle => !visibleIdentities.Contains(_previews[handle].Identity)).ToArray())
         {
             _previews[handle].Thumbnail.Dispose();
             _previews.Remove(handle);
@@ -2126,14 +2205,17 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         {
             if (profile.HideActivePreview && client.Handle == highlightHandle) continue;
 
-            if (!_previews.TryGetValue(client.Handle, out var state))
+            var identity = PreviewClientIdentity.From(client);
+            if (!_previews.TryGetValue(client.Handle, out var state) || state.Identity != identity)
             {
+                if (state != null) state.Thumbnail.Dispose();
                 state = new PreviewState(client, CreateThumbnail(client.Handle));
                 _previews[client.Handle] = state;
             }
 
             state.Client = client;
             state.FrameRect = ResolveFrameRect(client, visibleIndex++);
+            _positionMemory.Remember(identity, state.FrameRect);
             state.Active = client.Handle == highlightHandle;
             state.Visible = DwmAvailable;
             UpdateThumbnail(state);
@@ -2145,6 +2227,15 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         UpdateWindowRegion(shouldHideForLostFocus);
         RefreshLabelOverlay();
         Invalidate();
+    }
+
+    public bool HasPositionContextChanged(TriffViewProfile profile)
+    {
+        return !_positionMemory.MatchesContext(
+            profile.Id,
+            profile.PreviewWidth,
+            profile.PreviewHeight,
+            ScreenGeometry.MonitorTopologyPixels());
     }
 
     public IReadOnlyDictionary<string, TriffViewRect> CurrentPreviewLayouts()
@@ -2232,17 +2323,24 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     {
         foreach (var handle in _previews.Keys.Where(handle => handle == activeHandle).ToArray())
         {
+            var state = _previews[handle];
+            var liveClient = _clients.FirstOrDefault(client => PreviewClientIdentity.From(client) == state.Identity);
+            if (liveClient != null) _positionMemory.Remember(state.Identity, state.FrameRect);
             _previews[handle].Thumbnail.Dispose();
             _previews.Remove(handle);
         }
 
+        var liveIdentities = _clients.Select(PreviewClientIdentity.From).ToHashSet();
+        _positionMemory.PurgeExcept(liveIdentities);
         var visibleIndex = 0;
         foreach (var client in _clients)
         {
             if (client.Handle == activeHandle) continue;
 
-            if (!_previews.TryGetValue(client.Handle, out var state))
+            var identity = PreviewClientIdentity.From(client);
+            if (!_previews.TryGetValue(client.Handle, out var state) || state.Identity != identity)
             {
+                if (state != null) state.Thumbnail.Dispose();
                 state = new PreviewState(client, CreateThumbnail(client.Handle))
                 {
                     FrameRect = ResolveFrameRect(client, visibleIndex),
@@ -2251,6 +2349,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             }
 
             state.Client = client;
+            _positionMemory.Remember(identity, state.FrameRect);
             state.Active = false;
             state.Visible = DwmAvailable;
             UpdateThumbnail(state);
@@ -2491,11 +2590,19 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
     private Rectangle ResolveFrameRect(EveClientWindow client, int index)
     {
+        Rectangle? savedForCurrentKey = null;
         if (_profile.PreviewLayouts.TryGetValue(client.StableKey, out var saved) && saved.IsUsable)
         {
-            return saved.ToRectangle();
+            savedForCurrentKey = saved.ToRectangle();
         }
 
+        Rectangle? rememberedForClient = null;
+        if (_positionMemory.TryGet(PreviewClientIdentity.From(client), out var remembered))
+        {
+            rememberedForClient = remembered;
+        }
+
+        Rectangle? titleFallback = null;
         if (string.IsNullOrWhiteSpace(client.CharacterName)
             && _profile.PreviewLayouts.TryGetValue(client.Title, out var titleSaved)
             && titleSaved.IsUsable)
@@ -2510,9 +2617,18 @@ internal sealed class TriffViewOverlayForm : Forms.Form
                 rect.Y += sameTitleIndex * (rect.Height + 10);
             }
 
-            return ClampToVirtualDesktop(rect);
+            titleFallback = ClampToVirtualDesktop(rect);
         }
 
+        return TriffViewPreviewPositionMemory.Resolve(
+            savedForCurrentKey,
+            rememberedForClient,
+            titleFallback,
+            DefaultStackRect(index));
+    }
+
+    private Rectangle DefaultStackRect(int index)
+    {
         var primary = ScreenGeometry.PrimaryScreenPixels();
         var width = Math.Clamp(
             _profile.PreviewWidth,
@@ -2872,6 +2988,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         }
 
         public EveClientWindow Client { get; set; }
+        public PreviewClientIdentity Identity => PreviewClientIdentity.From(Client);
         public DwmThumbnail Thumbnail { get; }
         public Rectangle FrameRect { get; set; }
         public bool Active { get; set; }
@@ -4044,6 +4161,9 @@ internal static class TriffViewNativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool IsWindowVisible(nint hwnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool IsWindow(nint hwnd);
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool IsIconic(nint hwnd);
