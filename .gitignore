@@ -20,6 +20,7 @@ pnpm-debug.log*
 /native/TriffView.PreviewPositionTests/bin/
 /native/TriffView.PreviewPositionTests/obj/
 /native/Assets/overlay-dist.zip
+/tests/TriffView.CycleTests/
 /tests/**/bin/
 /tests/**/obj/
 *.user
