@@ -1922,42 +1922,43 @@ internal sealed class TriffViewController : IDisposable
 
         try
         {
-            var activated = TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+            TriffViewNativeMethods.SetForegroundWindow(client.Handle);
             TriffViewNativeMethods.SetFocus(client.Handle);
 
+            // Every branch below is gated on the observed foreground rather than on
+            // SetForegroundWindow's return value: the traces contain attempts where it
+            // returned true with the foreground unchanged. The calls are still made for
+            // their side effect, but only GetForegroundWindow is trusted as a verdict.
             if (profile.AlwaysMaximizeClients)
             {
                 TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwMaximize);
-                activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+                TriffViewNativeMethods.SetForegroundWindow(client.Handle);
                 if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
 
-                activated |= RetryWithTargetThreadAttached(
+                RetryWithTargetThreadAttached(
                     client.Handle,
                     currentThreadId,
                     targetThreadId,
                     attachedForeground ? foregroundThreadId : 0,
                     ref attachedTarget);
-                return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+                return TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
             }
 
             if (TriffViewNativeMethods.IsIconic(client.Handle))
             {
                 TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwRestore);
-                activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+                TriffViewNativeMethods.SetForegroundWindow(client.Handle);
             }
 
-            // Deliberately gated on the observed foreground rather than on SetForegroundWindow's
-            // return value: the traces contain attempts where it returned true with the
-            // foreground unchanged.
             if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
 
-            activated |= RetryWithTargetThreadAttached(
+            RetryWithTargetThreadAttached(
                 client.Handle,
                 currentThreadId,
                 targetThreadId,
                 attachedForeground ? foregroundThreadId : 0,
                 ref attachedTarget);
-            return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+            return TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
         }
         finally
         {
