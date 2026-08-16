@@ -1984,7 +1984,11 @@ internal sealed class TriffViewController : IDisposable
     /// The foreground thread already joined to ours, or 0 if none. Attaching to it twice
     /// would leave the detach in <c>TryActivateWindow</c> unbalanced.
     /// </param>
-    private static bool RetryWithTargetThreadAttached(
+    /// <remarks>
+    /// Returns nothing: callers judge success from <c>GetForegroundWindow</c>, not from
+    /// <c>SetForegroundWindow</c>'s return value, which cannot be trusted (see the caller).
+    /// </remarks>
+    private static void RetryWithTargetThreadAttached(
         nint handle,
         uint currentThreadId,
         uint targetThreadId,
@@ -1993,11 +1997,14 @@ internal sealed class TriffViewController : IDisposable
     {
         if (targetThreadId == 0 || targetThreadId == currentThreadId || targetThreadId == attachedForegroundThreadId)
         {
-            return false;
+            return;
         }
 
         attachedTarget = TriffViewNativeMethods.AttachThreadInput(currentThreadId, targetThreadId, true);
-        return attachedTarget && TriffViewNativeMethods.SetForegroundWindow(handle);
+        if (attachedTarget)
+        {
+            TriffViewNativeMethods.SetForegroundWindow(handle);
+        }
     }
 
     private void PostError(string action, string message)
