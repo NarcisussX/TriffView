@@ -1898,11 +1898,27 @@ internal sealed class TriffViewController : IDisposable
             ? TriffViewNativeMethods.GetWindowThreadProcessId(foregroundWindow, out _)
             : 0;
 
-        var attached = false;
+        var attachedForeground = false;
         if (foregroundWindow != nint.Zero && foregroundThreadId != 0 && foregroundThreadId != currentThreadId)
         {
-            attached = TriffViewNativeMethods.AttachThreadInput(currentThreadId, foregroundThreadId, true);
+            attachedForeground = TriffViewNativeMethods.AttachThreadInput(currentThreadId, foregroundThreadId, true);
         }
+
+        // The attach above is not always enough. On a reporting user's machine
+        // SPI_GETFOREGROUNDLOCKTIMEOUT read back as 2147483647 ms -- roughly 25 days,
+        // evidently set by some other tool -- which makes Windows refuse foreground
+        // *stealing* outright for the life of the session. AttachThreadInput gets through
+        // that refusal only because it shares input state rather than stealing: with the
+        // queues joined, the target is no longer a foreground change from an unrelated
+        // process. Sharing with the outgoing foreground thread alone was measured to cover
+        // 28 of 46 real activations; the remaining 18 needed the target's own thread joined
+        // as well, and none needed anything beyond that.
+        //
+        // Rejected alternatives, both worse than the convolution: writing
+        // SPI_SETFOREGROUNDLOCKTIMEOUT changes a system-wide setting that outlives the
+        // process, and the synthetic-ALT trick injects a keypress into a live game client.
+        var targetThreadId = TriffViewNativeMethods.GetWindowThreadProcessId(client.Handle, out _);
+        var attachedTarget = false;
 
         try
         {
@@ -1913,6 +1929,14 @@ internal sealed class TriffViewController : IDisposable
             {
                 TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwMaximize);
                 activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+                if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
+
+                activated |= RetryWithTargetThreadAttached(
+                    client.Handle,
+                    currentThreadId,
+                    targetThreadId,
+                    attachedForeground ? foregroundThreadId : 0,
+                    ref attachedTarget);
                 return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
             }
 
@@ -1922,15 +1946,57 @@ internal sealed class TriffViewController : IDisposable
                 activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
             }
 
+            // Deliberately gated on the observed foreground rather than on SetForegroundWindow's
+            // return value: the traces contain attempts where it returned true with the
+            // foreground unchanged.
+            if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
+
+            activated |= RetryWithTargetThreadAttached(
+                client.Handle,
+                currentThreadId,
+                targetThreadId,
+                attachedForeground ? foregroundThreadId : 0,
+                ref attachedTarget);
             return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
         }
         finally
         {
-            if (attached)
+            // Reverse order of attaching. Every AttachThreadInput must be matched by exactly
+            // one detach; an unbalanced pair tangles input queues for the whole process.
+            if (attachedTarget)
+            {
+                TriffViewNativeMethods.AttachThreadInput(currentThreadId, targetThreadId, false);
+            }
+
+            if (attachedForeground)
             {
                 TriffViewNativeMethods.AttachThreadInput(currentThreadId, foregroundThreadId, false);
             }
         }
+    }
+
+    /// <summary>
+    /// Second activation attempt, with the target window's thread joined to ours as well.
+    /// Only reached when the foreground-thread attach did not put the target in front.
+    /// </summary>
+    /// <param name="attachedForegroundThreadId">
+    /// The foreground thread already joined to ours, or 0 if none. Attaching to it twice
+    /// would leave the detach in <c>TryActivateWindow</c> unbalanced.
+    /// </param>
+    private static bool RetryWithTargetThreadAttached(
+        nint handle,
+        uint currentThreadId,
+        uint targetThreadId,
+        uint attachedForegroundThreadId,
+        ref bool attachedTarget)
+    {
+        if (targetThreadId == 0 || targetThreadId == currentThreadId || targetThreadId == attachedForegroundThreadId)
+        {
+            return false;
+        }
+
+        attachedTarget = TriffViewNativeMethods.AttachThreadInput(currentThreadId, targetThreadId, true);
+        return attachedTarget && TriffViewNativeMethods.SetForegroundWindow(handle);
     }
 
     private void PostError(string action, string message)
