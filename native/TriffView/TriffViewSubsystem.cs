@@ -725,22 +725,32 @@ internal sealed class TriffViewController : IDisposable
         var cursorKey = CycleCursorKey(profile.Id, group?.Id ?? groupId);
         _cycleGroupCursors.TryGetValue(cursorKey, out var cursorHandle);
         var liveForeground = TriffViewNativeMethods.GetForegroundWindow();
+        var candidateHandles = candidates.Select(client => client.Handle).ToArray();
         var nextIndex = TriffViewCycleState.NextIndex(
-            candidates.Select(client => client.Handle).ToArray(),
+            candidateHandles,
             direction,
             _activeClientHandle,
             liveForeground,
-            cursorHandle);
+            cursorHandle,
+            profile.RememberCycleGroupPositions);
         if (nextIndex < 0) return;
 
         var target = candidates[nextIndex];
         var previousCursor = cursorHandle;
-        _cycleGroupCursors[cursorKey] = target.Handle;
+        if (profile.RememberCycleGroupPositions)
+        {
+            _cycleGroupCursors[cursorKey] = target.Handle;
+        }
         if (TryActivateClient(target, profile)) return;
 
-        if (previousCursor != nint.Zero && candidates.Any(client => client.Handle == previousCursor))
+        if (!profile.RememberCycleGroupPositions) return;
+
+        var restoredCursor = TriffViewCycleState.CursorAfterFailedActivation(
+            candidateHandles,
+            previousCursor);
+        if (restoredCursor != nint.Zero)
         {
-            _cycleGroupCursors[cursorKey] = previousCursor;
+            _cycleGroupCursors[cursorKey] = restoredCursor;
         }
         else
         {
@@ -750,7 +760,7 @@ internal sealed class TriffViewController : IDisposable
 
     private void RememberCycleCursorForActiveGroups(TriffViewProfile profile, nint handle)
     {
-        if (handle == nint.Zero) return;
+        if (!profile.RememberCycleGroupPositions || handle == nint.Zero) return;
 
         foreach (var group in profile.ActiveCycleGroups())
         {
@@ -772,9 +782,20 @@ internal sealed class TriffViewController : IDisposable
         }
     }
 
-    private static string CycleCursorKey(string profileId, string groupId)
+    internal static string CycleCursorKey(string profileId, string groupId)
     {
         return $"{profileId}\u001f{groupId}";
+    }
+
+    internal static bool ApplyRememberCycleGroupPositionsSetting(
+        TriffViewProfile profile,
+        bool enabled,
+        IDictionary<string, nint> cursors)
+    {
+        if (profile.RememberCycleGroupPositions == enabled) return false;
+        profile.RememberCycleGroupPositions = enabled;
+        cursors.Clear();
+        return true;
     }
 
     private List<EveClientWindow> ResolveCycleCandidates(IReadOnlyList<string> cycleNames)
@@ -800,6 +821,7 @@ internal sealed class TriffViewController : IDisposable
         if (patch == null) return;
         var profile = Settings.ActiveProfile();
         var previewSizeChanged = false;
+        var cycleCursorMemoryChanged = false;
 
         foreach (var (key, value) in patch)
         {
@@ -869,6 +891,12 @@ internal sealed class TriffViewController : IDisposable
                 case "hotkeysRequireEveForeground":
                     profile.HotkeysRequireEveForeground = value?.GetValue<bool>() == true;
                     break;
+                case "rememberCycleGroupPositions":
+                    cycleCursorMemoryChanged |= ApplyRememberCycleGroupPositionsSetting(
+                        profile,
+                        value?.GetValue<bool>() != false,
+                        _cycleGroupCursors);
+                    break;
                 case "activeBorderColor":
                     profile.ActiveBorderColor = CleanColor(value, profile.ActiveBorderColor);
                     break;
@@ -905,8 +933,14 @@ internal sealed class TriffViewController : IDisposable
                 case "directHotkeysText":
                     profile.DirectHotkeys = ParseDirectHotkeys(value?.GetValue<string>());
                     break;
+                case "cycleGroups":
+                    profile.CycleGroups = ParseCycleGroups(value as JsonArray);
+                    break;
                 case "cycleGroupsText":
-                    profile.CycleGroups = ParseCycleGroups(value?.GetValue<string>());
+                    if (!patch.ContainsKey("cycleGroups"))
+                    {
+                        profile.CycleGroups = ParseCycleGroups(value?.GetValue<string>());
+                    }
                     break;
                 case "selectedCycleGroupId":
                     profile.SelectedCycleGroupId = value?.GetValue<string>()?.Trim() ?? "";
@@ -921,6 +955,10 @@ internal sealed class TriffViewController : IDisposable
         }
         Settings.Save();
         Refresh();
+        if (cycleCursorMemoryChanged)
+        {
+            _cycleGroupCursors.Clear();
+        }
     }
 
     private void ApplyAlertsPatch(JsonObject? patch)
@@ -2099,6 +2137,34 @@ internal sealed class TriffViewController : IDisposable
         return groups;
     }
 
+    internal static List<TriffViewCycleGroup> ParseCycleGroups(JsonArray? value)
+    {
+        if (value == null) return new List<TriffViewCycleGroup>();
+
+        var groups = new List<TriffViewCycleGroup>();
+        foreach (var node in value)
+        {
+            if (node is not JsonObject item) continue;
+            var name = JsonString(item, "name")?.Trim();
+            if (string.IsNullOrWhiteSpace(name)) name = "Cycle group";
+
+            var characters = item["characters"] is JsonArray
+                ? EveXStringList(item["characters"])
+                : SplitLines(JsonString(item, "charactersText"));
+            groups.Add(new TriffViewCycleGroup
+            {
+                Id = JsonString(item, "id")?.Trim() ?? TriffViewCycleGroup.IdFromName(name),
+                Name = name,
+                ForwardGestures = GestureList(item["forwardGestures"] ?? item["forwardGesture"]),
+                BackwardGestures = GestureList(item["backwardGestures"] ?? item["backwardGesture"]),
+                Characters = characters,
+                Enabled = JsonBool(item, "enabled", true),
+            });
+        }
+
+        return groups;
+    }
+
     private static List<TriffViewCycleGroup> ImportEveXCycleGroups(JsonObject? sourceGroups)
     {
         if (sourceGroups == null) return new List<TriffViewCycleGroup>();
@@ -2493,6 +2559,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         if (suspended) return;
 
         var failures = new List<string>();
+        var claimedGestures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         var directHotkeyGroups = profile.DirectHotkeys
             .Where(binding => binding.Enabled
                 && !string.IsNullOrWhiteSpace(binding.CharacterName)
@@ -2512,6 +2579,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
                 .Select(binding => binding.CharacterName)
                 .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToArray();
+            claimedGestures[group.Key] = "direct character hotkey";
             RegisterHotkey(
                 group.Key,
                 new TriffViewHotkeyCommand(TriffViewHotkeyKind.Direct, "", "", 0, characterNames),
@@ -2519,18 +2587,16 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             );
         }
 
-        foreach (var group in profile.ActiveCycleGroups())
+        foreach (var registration in TriffViewCycleHotkeyPlanner.Plan(profile, claimedGestures, failures))
         {
-            if (group.Characters.Count == 0 && profile.CharacterOrder.Count == 0) continue;
-            foreach (var gesture in group.ForwardGestures)
-            {
-                RegisterHotkey(gesture, new TriffViewHotkeyCommand(TriffViewHotkeyKind.Cycle, "", group.Id, 1), failures);
-            }
-
-            foreach (var gesture in group.BackwardGestures)
-            {
-                RegisterHotkey(gesture, new TriffViewHotkeyCommand(TriffViewHotkeyKind.Cycle, "", group.Id, -1), failures);
-            }
+            RegisterHotkey(
+                registration.Gesture,
+                new TriffViewHotkeyCommand(
+                    TriffViewHotkeyKind.Cycle,
+                    "",
+                    registration.GroupId,
+                    registration.Direction),
+                failures);
         }
 
         HotkeyFailures = failures;
@@ -3088,14 +3154,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         HotkeyFailures = Array.Empty<string>();
     }
 
-    private static string HotkeySignature(TriffViewProfile profile, IReadOnlyList<EveClientWindow> clients, bool suspended)
+    internal static string HotkeySignature(TriffViewProfile profile, IReadOnlyList<EveClientWindow> clients, bool suspended)
     {
         if (suspended) return $"suspended:{profile.Id}";
         var direct = string.Join(";", profile.DirectHotkeys.Select(binding => $"{binding.Enabled}:{binding.CharacterName}:{string.Join(",", binding.Gestures)}"));
         var cycles = string.Join(";", profile.CycleGroups.Select(group => $"{group.Enabled}:{group.Id}:{string.Join(",", group.ForwardGestures)}:{string.Join(",", group.BackwardGestures)}:{string.Join(",", group.Characters)}"));
         var characterOrder = string.Join(",", profile.CharacterOrder);
         var clientKeys = string.Join(";", clients.Select(client => client.StableKey));
-        return $"{profile.Id}|{profile.SelectedCycleGroupId}|{direct}|{cycles}|{characterOrder}|{clientKeys}";
+        return $"{profile.Id}|{direct}|{cycles}|{characterOrder}|{clientKeys}";
     }
 
     private static GraphicsPath RoundedRect(Rectangle rect, int radius)
@@ -3649,6 +3715,7 @@ internal sealed class TriffViewProfile
     public bool AlwaysMaximizeClients { get; set; }
     public bool AutoRestoreClientLayouts { get; set; }
     public bool HotkeysRequireEveForeground { get; set; } = true;
+    public bool RememberCycleGroupPositions { get; set; } = true;
     public string ActiveBorderColor { get; set; } = "#53B6FF";
     public string InactiveBorderColor { get; set; } = "#737B8C";
     public string LabelTextColor { get; set; } = "#D9E2EE";
@@ -3750,6 +3817,7 @@ internal sealed class TriffViewProfile
             alwaysMaximizeClients = AlwaysMaximizeClients,
             autoRestoreClientLayouts = AutoRestoreClientLayouts,
             hotkeysRequireEveForeground = HotkeysRequireEveForeground,
+            rememberCycleGroupPositions = RememberCycleGroupPositions,
             activeBorderColor = ActiveBorderColor,
             inactiveBorderColor = InactiveBorderColor,
             labelTextColor = LabelTextColor,
@@ -3788,9 +3856,7 @@ internal sealed class TriffViewProfile
     public IEnumerable<TriffViewCycleGroup> ActiveCycleGroups()
     {
         Normalize();
-        var active = CycleGroups.FirstOrDefault(group => group.Enabled
-            && string.Equals(group.Id, SelectedCycleGroupId, StringComparison.OrdinalIgnoreCase));
-        return active != null ? new[] { active } : CycleGroups.Where(group => group.Enabled).Take(1);
+        return CycleGroups.Where(group => group.Enabled);
     }
 
     public string PreviewLabelFor(EveClientWindow client)
@@ -3983,6 +4049,69 @@ internal sealed class TriffViewHotkeyCommand
     public string GroupId { get; }
     public int Direction { get; }
     public IReadOnlyList<string> CharacterNames { get; }
+}
+
+internal sealed record TriffViewCycleHotkeyRegistration(
+    string Gesture,
+    string GroupId,
+    string GroupName,
+    int Direction,
+    string DirectionName);
+
+internal static class TriffViewCycleHotkeyPlanner
+{
+    public static IReadOnlyList<TriffViewCycleHotkeyRegistration> Plan(
+        TriffViewProfile profile,
+        IReadOnlyDictionary<string, string>? preclaimedGestures,
+        IList<string> failures)
+    {
+        var claimedGestures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (preclaimedGestures != null)
+        {
+            foreach (var (gesture, owner) in preclaimedGestures)
+            {
+                claimedGestures[gesture] = owner;
+            }
+        }
+
+        var registrations = new List<TriffViewCycleHotkeyRegistration>();
+        foreach (var group in profile.ActiveCycleGroups())
+        {
+            if (group.Characters.Count == 0 && profile.CharacterOrder.Count == 0) continue;
+            AddGroupGestures(group, group.ForwardGestures, 1, "forward", claimedGestures, registrations, failures);
+            AddGroupGestures(group, group.BackwardGestures, -1, "backward", claimedGestures, registrations, failures);
+        }
+
+        return registrations;
+    }
+
+    private static void AddGroupGestures(
+        TriffViewCycleGroup group,
+        IEnumerable<string> gestures,
+        int direction,
+        string directionName,
+        IDictionary<string, string> claimedGestures,
+        ICollection<TriffViewCycleHotkeyRegistration> registrations,
+        ICollection<string> failures)
+    {
+        var owner = $"cycle group \"{group.Name}\" {directionName}";
+        foreach (var gesture in gestures)
+        {
+            if (claimedGestures.TryGetValue(gesture, out var existingOwner))
+            {
+                failures.Add($"{gesture}: {owner} conflicts with {existingOwner}; only the first configured binding is active");
+                continue;
+            }
+
+            claimedGestures[gesture] = owner;
+            registrations.Add(new TriffViewCycleHotkeyRegistration(
+                gesture,
+                group.Id,
+                group.Name,
+                direction,
+                directionName));
+        }
+    }
 }
 
 internal enum TriffViewHotkeyKind

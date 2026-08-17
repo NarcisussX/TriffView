@@ -3207,8 +3207,169 @@ button:disabled {
   flex-direction: column;
   gap: 10px;
   border: 0;
+  border-top: 1px solid var(--tv-border-muted);
+  background: transparent;
+  padding: 12px 0 0;
+}
+
+.triffview-cycle-card h5 {
+  margin: 0;
+  color: var(--tv-text-strong);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.triffview-cycle-table-wrap {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--tv-border-muted);
+  background: rgba(var(--tv-surface-rgb), 0.72);
+}
+
+.triffview-cycle-memory-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 32px;
+  gap: 6px;
+  align-items: stretch;
+}
+
+.triffview-cycle-memory-row .triffview-toggle {
+  min-width: 0;
+}
+
+.triffview-info-button {
+  display: inline-flex;
+  width: 32px;
+  min-width: 32px;
+  min-height: 32px;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--tv-border);
+  border-radius: 0;
+  background: var(--tv-control-bg);
+  color: var(--tv-accent);
+  padding: 0;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.triffview-info-button:hover,
+.triffview-info-button[aria-expanded="true"] {
+  border-color: var(--tv-accent);
+  color: var(--tv-text-strong);
+}
+
+.triffview-cycle-memory-help {
+  border: 1px solid var(--tv-border-muted);
+  border-left-color: var(--tv-accent);
+  background: rgba(var(--tv-surface-rgb), 0.72);
+  color: var(--tv-text-muted);
+  padding: 8px 10px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.triffview-cycle-memory-help p {
+  margin: 0;
+}
+
+.triffview-cycle-memory-help p + p {
+  margin-top: 7px;
+}
+
+.triffview-cycle-table {
+  width: 100%;
+  min-width: 650px;
+  border-collapse: collapse;
+  table-layout: fixed;
+  color: var(--tv-text);
+  font-size: 11px;
+}
+
+.triffview-cycle-table th,
+.triffview-cycle-table td {
+  height: 34px;
+  border-bottom: 1px solid var(--tv-border-muted);
+  padding: 5px 8px;
+  overflow: hidden;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.triffview-cycle-table th {
+  background: var(--tv-control-bg);
+  color: var(--tv-muted);
+  font-size: 10px;
+  font-weight: 700;
+}
+
+.triffview-cycle-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.triffview-cycle-table tbody tr {
+  background: rgba(var(--tv-bg-rgb), 0.48);
+}
+
+.triffview-cycle-table tbody tr:hover,
+.triffview-cycle-table tbody tr.is-selected {
+  background: var(--tv-control-bg);
+}
+
+.triffview-cycle-table tbody tr.is-selected td:first-child {
+  box-shadow: inset 2px 0 0 var(--tv-accent);
+}
+
+.triffview-cycle-table .is-active-column {
+  width: 58px;
+  text-align: center;
+}
+
+.triffview-cycle-table .is-members-column {
+  width: 68px;
+  text-align: center;
+}
+
+.triffview-cycle-table .is-action-column {
+  width: 62px;
+  text-align: right;
+}
+
+.triffview-cycle-table input[type="checkbox"] {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--tv-accent);
+}
+
+.triffview-cycle-table button {
+  min-height: 24px;
+  border: 1px solid var(--tv-border);
+  border-radius: 0;
+  background: var(--tv-control-bg);
+  color: var(--tv-text);
+  padding: 0 8px;
+  font: inherit;
+  font-weight: 700;
+}
+
+.triffview-cycle-table button:hover {
+  border-color: var(--tv-accent);
+  color: var(--tv-text-strong);
+}
+
+.triffview-cycle-table .triffview-cycle-name {
+  display: block;
+  width: 100%;
+  overflow: hidden;
+  border: 0;
   background: transparent;
   padding: 0;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .triffview-profile-create {
