@@ -1885,25 +1885,126 @@ internal sealed class TriffViewController : IDisposable
         _switchStateTimer.Start();
     }
 
-    private bool ActivateWindow(EveClientWindow client, TriffViewProfile profile)
+    private static bool ActivateWindow(EveClientWindow client, TriffViewProfile profile)
     {
-        var activated = TriffViewNativeMethods.SetForegroundWindow(client.Handle);
-        TriffViewNativeMethods.SetFocus(client.Handle);
+        // The overlay is WS_EX_NOACTIVATE + ShowWithoutActivation, so TriffView's process never
+        // holds the foreground; Windows refuses SetForegroundWindow from a background process
+        // unless its thread's input queue is attached to the current foreground thread's. Without
+        // this, a held/auto-repeating key (the reported trigger was push-to-talk) keeps feeding
+        // input to the other foreground process and clicking a preview does nothing.
+        var foregroundWindow = TriffViewNativeMethods.GetForegroundWindow();
+        var currentThreadId = TriffViewNativeMethods.GetCurrentThreadId();
+        var foregroundThreadId = foregroundWindow != nint.Zero
+            ? TriffViewNativeMethods.GetWindowThreadProcessId(foregroundWindow, out _)
+            : 0;
 
-        if (profile.AlwaysMaximizeClients)
+        var attachedForeground = false;
+        if (foregroundWindow != nint.Zero && foregroundThreadId != 0 && foregroundThreadId != currentThreadId)
         {
-            TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwMaximize);
-            activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
-            return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+            attachedForeground = TriffViewNativeMethods.AttachThreadInput(currentThreadId, foregroundThreadId, true);
         }
 
-        if (TriffViewNativeMethods.IsIconic(client.Handle))
+        // The attach above is not always enough. On a reporting user's machine
+        // SPI_GETFOREGROUNDLOCKTIMEOUT read back as 2147483647 ms -- roughly 25 days,
+        // evidently set by some other tool -- which makes Windows refuse foreground
+        // *stealing* outright for the life of the session. AttachThreadInput gets through
+        // that refusal only because it shares input state rather than stealing: with the
+        // queues joined, the target is no longer a foreground change from an unrelated
+        // process. Sharing with the outgoing foreground thread alone was measured to cover
+        // 28 of 46 real activations; the remaining 18 needed the target's own thread joined
+        // as well, and none needed anything beyond that.
+        //
+        // Rejected alternatives, both worse than the convolution: writing
+        // SPI_SETFOREGROUNDLOCKTIMEOUT changes a system-wide setting that outlives the
+        // process, and the synthetic-ALT trick injects a keypress into a live game client.
+        var targetThreadId = TriffViewNativeMethods.GetWindowThreadProcessId(client.Handle, out _);
+        var attachedTarget = false;
+
+        try
         {
-            TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwRestore);
-            activated |= TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+            TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+            TriffViewNativeMethods.SetFocus(client.Handle);
+
+            // Every branch below is gated on the observed foreground rather than on
+            // SetForegroundWindow's return value: the traces contain attempts where it
+            // returned true with the foreground unchanged. The calls are still made for
+            // their side effect, but only GetForegroundWindow is trusted as a verdict.
+            if (profile.AlwaysMaximizeClients)
+            {
+                TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwMaximize);
+                TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+                if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
+
+                RetryWithTargetThreadAttached(
+                    client.Handle,
+                    currentThreadId,
+                    targetThreadId,
+                    attachedForeground ? foregroundThreadId : 0,
+                    ref attachedTarget);
+                return TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+            }
+
+            if (TriffViewNativeMethods.IsIconic(client.Handle))
+            {
+                TriffViewNativeMethods.ShowWindowAsync(client.Handle, TriffViewNativeMethods.SwRestore);
+                TriffViewNativeMethods.SetForegroundWindow(client.Handle);
+            }
+
+            if (TriffViewNativeMethods.GetForegroundWindow() == client.Handle) return true;
+
+            RetryWithTargetThreadAttached(
+                client.Handle,
+                currentThreadId,
+                targetThreadId,
+                attachedForeground ? foregroundThreadId : 0,
+                ref attachedTarget);
+            return TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+        }
+        finally
+        {
+            // Reverse order of attaching. Every AttachThreadInput must be matched by exactly
+            // one detach; an unbalanced pair tangles input queues for the whole process.
+            if (attachedTarget)
+            {
+                TriffViewNativeMethods.AttachThreadInput(currentThreadId, targetThreadId, false);
+            }
+
+            if (attachedForeground)
+            {
+                TriffViewNativeMethods.AttachThreadInput(currentThreadId, foregroundThreadId, false);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Second activation attempt, with the target window's thread joined to ours as well.
+    /// Only reached when the foreground-thread attach did not put the target in front.
+    /// </summary>
+    /// <param name="attachedForegroundThreadId">
+    /// The foreground thread already joined to ours, or 0 if none. Attaching to it twice
+    /// would leave the detach in <c>TryActivateWindow</c> unbalanced.
+    /// </param>
+    /// <remarks>
+    /// Returns nothing: callers judge success from <c>GetForegroundWindow</c>, not from
+    /// <c>SetForegroundWindow</c>'s return value, which cannot be trusted (see the caller).
+    /// </remarks>
+    private static void RetryWithTargetThreadAttached(
+        nint handle,
+        uint currentThreadId,
+        uint targetThreadId,
+        uint attachedForegroundThreadId,
+        ref bool attachedTarget)
+    {
+        if (targetThreadId == 0 || targetThreadId == currentThreadId || targetThreadId == attachedForegroundThreadId)
+        {
+            return;
         }
 
-        return activated || TriffViewNativeMethods.GetForegroundWindow() == client.Handle;
+        attachedTarget = TriffViewNativeMethods.AttachThreadInput(currentThreadId, targetThreadId, true);
+        if (attachedTarget)
+        {
+            TriffViewNativeMethods.SetForegroundWindow(handle);
+        }
     }
 
     private void PostError(string action, string message)
@@ -2062,7 +2163,6 @@ internal sealed class ActivePreviewAlert
 internal sealed class TriffViewOverlayForm : Forms.Form
 {
     private const int ResizeHitSize = 16;
-    private const int DragThreshold = 4;
     private readonly Dictionary<nint, PreviewState> _previews = new();
     private readonly TriffViewPreviewPositionMemory _positionMemory = new();
     private readonly Dictionary<int, TriffViewHotkeyCommand> _hotkeys = new();
@@ -2240,11 +2340,15 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
     public IReadOnlyDictionary<string, TriffViewRect> CurrentPreviewLayouts()
     {
-        return _previews.Values.ToDictionary(
-            state => state.Client.StableKey,
-            state => TriffViewRect.FromRectangle(state.FrameRect),
-            StringComparer.OrdinalIgnoreCase
-        );
+        // Nameless clients (character select) key on their window handle in hex, which would be an
+        // orphan the moment the window closes. Save only layouts that can be matched again.
+        return _previews.Values
+            .Where(state => !string.IsNullOrWhiteSpace(state.Client.CharacterName))
+            .ToDictionary(
+                state => state.Client.StableKey,
+                state => TriffViewRect.FromRectangle(state.FrameRect),
+                StringComparer.OrdinalIgnoreCase
+            );
     }
 
     public void MarkActiveClient(nint activeHandle)
@@ -2519,9 +2623,17 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
         var deltaX = e.Location.X - _mouseDownPoint.X;
         var deltaY = e.Location.Y - _mouseDownPoint.Y;
-        if (_mouseMode == MouseMode.PendingClick && Math.Abs(deltaX) + Math.Abs(deltaY) > DragThreshold)
+
+        // Locked previews cannot be dragged, so there is nothing for this displacement check to
+        // decide: a press stays PendingClick no matter how far the cursor travels before release,
+        // and OnMouseUp judges the click by where the button came back up instead. Reclassifying
+        // to Move/None here on distance alone is exactly what used to swallow clicks made while
+        // the mouse was in motion — a real click covers far more than SM_CXDRAG at ordinary speed.
+        if (_mouseMode == MouseMode.PendingClick
+            && !_profile.LockPreviews
+            && !PreviewPointerGesture.IsClick(_mouseDownPoint, e.Location, Forms.SystemInformation.DragSize))
         {
-            _mouseMode = _profile.LockPreviews ? MouseMode.None : MouseMode.Move;
+            _mouseMode = MouseMode.Move;
         }
 
         if (_mouseMode == MouseMode.Move)
@@ -2565,12 +2677,52 @@ internal sealed class TriffViewOverlayForm : Forms.Form
 
         if (mode is MouseMode.Move or MouseMode.Resize)
         {
+            // A left press that drifted past the drag metric enters Move mode and never leaves
+            // it, even if the cursor comes back. Judging the gesture on where the press actually
+            // ended means an imprecise click still switches clients instead of being swallowed
+            // and silently nudging the preview a few pixels.
+            if (mode == MouseMode.Move
+                && e.Button == Forms.MouseButtons.Left
+                && PreviewPointerGesture.IsClick(_mouseDownPoint, e.Location, Forms.SystemInformation.DragSize))
+            {
+                preview.FrameRect = _mouseStartRect;
+                _positionMemory.Remember(PreviewClientIdentity.From(preview.Client), preview.FrameRect);
+                UpdateThumbnail(preview);
+                UpdateWindowRegion();
+                RefreshLabelOverlay();
+                Invalidate();
+                ActivateRequested?.Invoke(preview.Client);
+                return;
+            }
+
+            _positionMemory.Remember(PreviewClientIdentity.From(preview.Client), preview.FrameRect);
+
+            // A client at character select has no name, so its StableKey is the window handle in hex.
+            // Persisting under that key would write an orphan into settings that can never match again
+            // and is never pruned. The remembered frame above still honours the drag on screen.
+            if (string.IsNullOrWhiteSpace(preview.Client.CharacterName)) return;
+
             PreviewLayoutChanged?.Invoke(preview.Client.StableKey, TriffViewRect.FromRectangle(preview.FrameRect));
             return;
         }
 
         if (mode == MouseMode.PendingClick && e.Button == Forms.MouseButtons.Left)
         {
+            // Locked previews never leave PendingClick in OnMouseMove regardless of distance
+            // travelled, so the gesture is decided here instead: release over the SAME preview
+            // that was pressed activates it, release elsewhere is a cancelled click (pressed,
+            // changed their mind, dragged off before letting go). Checked against the pressed
+            // preview's own frame rather than HitPreview so an overlapping preview can't steal it.
+            if (_profile.LockPreviews)
+            {
+                var releaseAbsolute = new Point(e.Location.X + _virtualDesktop.Left, e.Location.Y + _virtualDesktop.Top);
+                if (PreviewPointerGesture.IsLockedReleaseActivation(preview.FrameRect, releaseAbsolute))
+                {
+                    ActivateRequested?.Invoke(preview.Client);
+                }
+                return;
+            }
+
             ActivateRequested?.Invoke(preview.Client);
         }
     }
@@ -4211,6 +4363,12 @@ internal static class TriffViewNativeMethods
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern nint SetFocus(nint hwnd);
+
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("kernel32.dll")]
+    public static extern uint GetCurrentThreadId();
 
     [DllImport("user32.dll", SetLastError = true)]
     public static extern bool ShowWindow(nint hwnd, int command);
