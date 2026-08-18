@@ -28,6 +28,7 @@ internal sealed class EveSettingsController
     private readonly Action<object> _postToHud;
     private readonly EveSettingsLocalState _settings;
     private readonly Dictionary<long, string> _characterNames = new();
+    private readonly HashSet<long> _unresolvableCharacterIds = new();
     private string _lastPostedStateJson = "";
 
     public EveSettingsController(Dispatcher dispatcher, Action<object> postToHud)
@@ -816,22 +817,35 @@ internal sealed class EveSettingsController
 
         try
         {
-            using var content = new StringContent(JsonSerializer.Serialize(missing), Encoding.UTF8, "application/json");
-            using var response = await Http.PostAsync("https://esi.evetech.net/latest/universe/names/?datasource=tranquility", content);
-            if (!response.IsSuccessStatusCode) return;
-            var json = await response.Content.ReadAsStringAsync();
-            if (JsonNode.Parse(json) is not JsonArray array) return;
-
-            foreach (var node in array.OfType<JsonObject>())
-            {
-                var id = node["id"]?.GetValue<long>() ?? 0;
-                var name = node["name"]?.GetValue<string>()?.Trim() ?? "";
-                if (id > 0 && !string.IsNullOrWhiteSpace(name)) _characterNames[id] = name;
-            }
+            // Bound the whole bisect chain so one stubborn batch can't stall a state refresh:
+            // each request already times out at 8s, but a fully-poisoned batch of 250 could
+            // otherwise chain hundreds of them.
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(30));
+            var resolved = await CharacterNameBatchResolver.ResolveAsync(
+                missing,
+                _unresolvableCharacterIds,
+                ResolveNameBatchViaEsiAsync,
+                cts.Token);
+            foreach (var (id, name) in resolved) _characterNames[id] = name;
         }
         catch
         {
             // Character names are nice-to-have; raw IDs keep the tool usable offline.
+        }
+    }
+
+    private static async Task<NameBatchOutcome> ResolveNameBatchViaEsiAsync(IReadOnlyList<long> ids, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var content = new StringContent(JsonSerializer.Serialize(ids), Encoding.UTF8, "application/json");
+            using var response = await Http.PostAsync("https://esi.evetech.net/latest/universe/names/?datasource=tranquility", content, cancellationToken);
+            var body = await response.Content.ReadAsStringAsync(cancellationToken);
+            return CharacterNameBatchResolver.ClassifyResponse(response.StatusCode, body);
+        }
+        catch (Exception exception) when (exception is HttpRequestException or OperationCanceledException or JsonException or IOException)
+        {
+            return NameBatchOutcome.Transient;
         }
     }
 
