@@ -68,6 +68,7 @@ internal sealed class TriffViewController : IDisposable
         _overlay.MinimizeRequested += MinimizeClient;
         _overlay.PreviewLayoutChanged += SavePreviewLayout;
         _overlay.HotkeyPressed += HandleHotkey;
+        _overlay.HotkeyStatusChanged += () => PostState();
         _alerts.AlertTriggered += OnAlertTriggered;
         _alerts.UpdateSettings(Settings.Alerts);
 
@@ -390,12 +391,13 @@ internal sealed class TriffViewController : IDisposable
         {
             AutoRestoreClientLayouts(profile, _clients);
             _overlay.SetClients(_clients, profile, foreground, activeHandle: activeHandle);
-            _overlay.ConfigureHotkeys(profile, _clients, Settings.HotkeysSuspended);
         }
         else
         {
             _overlay.SyncClientStates(_clients, foreground, activeHandle);
         }
+
+        _overlay.ConfigureHotkeys(profile, _clients, Settings.HotkeysSuspended);
 
         if (showOverlayAfterRefresh) ShowOverlay();
         if (topologyChanged || stateChanged) PostState();
@@ -497,12 +499,15 @@ internal sealed class TriffViewController : IDisposable
         TryActivateClient(client, Settings.ActiveProfileFast());
     }
 
-    private bool TryActivateClient(EveClientWindow client, TriffViewProfile profile)
+    private bool TryActivateClient(EveClientWindow client, TriffViewProfile profile, bool fromHotkey = false)
     {
         try
         {
             var previousClient = ResolvePreviousActiveClient(client.Handle);
-            if (!ActivateWindow(client, profile)) return false;
+            bool Activate() => fromHotkey
+                ? _overlay.ActivateFromHotkey(client.Handle, profile.AlwaysMaximizeClients)
+                : ActivateWindow(client, profile);
+            if (!Activate()) return false;
 
             _activeClientHandle = client.Handle;
             RememberCycleCursorForActiveGroups(profile, client.Handle);
@@ -516,7 +521,7 @@ internal sealed class TriffViewController : IDisposable
                 }
 
                 SendMinimizeClient(previousClient!.Handle);
-                ActivateWindow(client, profile);
+                Activate();
             }
 
             return true;
@@ -703,7 +708,7 @@ internal sealed class TriffViewController : IDisposable
             var target = _clients.FirstOrDefault(client => characterNames.Any(characterName =>
                 string.Equals(client.CharacterName, characterName, StringComparison.OrdinalIgnoreCase)
                 || string.Equals(client.StableKey, characterName, StringComparison.OrdinalIgnoreCase)));
-            if (target != null) TryActivateClient(target, profile);
+            if (target != null) TryActivateClient(target, profile, fromHotkey: true);
             return;
         }
 
@@ -741,7 +746,7 @@ internal sealed class TriffViewController : IDisposable
         {
             _cycleGroupCursors[cursorKey] = target.Handle;
         }
-        if (TryActivateClient(target, profile)) return;
+        if (TryActivateClient(target, profile, fromHotkey: true)) return;
 
         if (!profile.RememberCycleGroupPositions) return;
 
@@ -1611,7 +1616,7 @@ internal sealed class TriffViewController : IDisposable
     private static List<string> CleanGestureList(IEnumerable<string>? gestures)
     {
         return (gestures ?? Array.Empty<string>())
-            .SelectMany(gesture => (gesture ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            .SelectMany(AhkGesture.SplitList)
             .Select(NormalizeGesture)
             .Where(gesture => gesture.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -1693,65 +1698,7 @@ internal sealed class TriffViewController : IDisposable
         return $"#{color.R:X2}{color.G:X2}{color.B:X2}";
     }
 
-    private static string NormalizeEveXGesture(string gesture)
-    {
-        var clean = (gesture ?? "").Trim();
-        if (clean.Length == 0) return "";
-
-        if (clean.Contains("XButton", StringComparison.OrdinalIgnoreCase)
-            || clean.Contains("MButton", StringComparison.OrdinalIgnoreCase)
-            || clean.Contains("LButton", StringComparison.OrdinalIgnoreCase)
-            || clean.Contains("RButton", StringComparison.OrdinalIgnoreCase))
-        {
-            return "";
-        }
-
-        if (clean.Contains('&'))
-        {
-            var chordParts = clean.Split('&', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-                .Select(NormalizeEveXGesturePart)
-                .Where(part => part.Length > 0)
-                .ToArray();
-            return chordParts.Length > 0 ? NormalizeGesture(string.Join("+", chordParts)) : "";
-        }
-
-        var modifiers = new List<string>();
-        while (clean.Length > 0)
-        {
-            var modifier = clean[0] switch
-            {
-                '^' => "Control",
-                '!' => "Alt",
-                '+' => "Shift",
-                '#' => "Win",
-                _ => "",
-            };
-            if (modifier.Length == 0) break;
-            modifiers.Add(modifier);
-            clean = clean[1..].TrimStart();
-        }
-
-        clean = string.Join("+", clean
-            .Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries)
-            .Select(NormalizeEveXGesturePart)
-            .Where(part => part.Length > 0));
-
-        if (clean.Length == 0) return "";
-        return NormalizeGesture(modifiers.Count > 0 ? $"{string.Join("+", modifiers)}+{clean}" : clean);
-    }
-
-    private static string NormalizeEveXGesturePart(string value)
-    {
-        var trimmed = (value ?? "").Trim();
-        return trimmed.ToLowerInvariant() switch
-        {
-            "ctrl" or "control" => "Control",
-            "alt" => "Alt",
-            "shift" => "Shift",
-            "win" or "windows" => "Win",
-            var key => key.Length > 0 ? trimmed.Replace(" ", "") : "",
-        };
-    }
+    internal static string NormalizeEveXGesture(string gesture) => gesture.Trim();
 
     private static string EveXString(JsonNode? node)
     {
@@ -2231,12 +2178,10 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     private const int ResizeHitSize = 16;
     private readonly Dictionary<nint, PreviewState> _previews = new();
     private readonly TriffViewPreviewPositionMemory _positionMemory = new();
-    private readonly Dictionary<int, TriffViewHotkeyCommand> _hotkeys = new();
+    private readonly TriffViewAhkHotkeys _ahkHotkeys = new(new AhkWindowTransport());
     private readonly Forms.Timer _alertTimer = new() { Interval = 80 };
     private readonly TriffViewLabelOverlayForm _labelOverlay = new();
-    private string _hotkeySignature = "";
     private string _windowRegionSignature = "";
-    private int _nextHotkeyId = 3000;
     private PreviewState? _mousePreview;
     private MouseMode _mouseMode = MouseMode.None;
     private Point _mouseDownPoint;
@@ -2252,13 +2197,16 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     public event Action<EveClientWindow>? MinimizeRequested;
     public event Action<string, TriffViewRect>? PreviewLayoutChanged;
     public event Action<TriffViewHotkeyCommand>? HotkeyPressed;
+    public event Action? HotkeyStatusChanged;
 
     public bool AllowTopmost { get; set; } = true;
     public bool DwmAvailable { get; private set; } = true;
-    public IReadOnlyList<string> HotkeyFailures { get; private set; } = Array.Empty<string>();
+    public IReadOnlyList<string> HotkeyFailures => _ahkHotkeys.Failures;
 
     public TriffViewOverlayForm()
     {
+        _ahkHotkeys.Pressed += command => HotkeyPressed?.Invoke(command);
+        _ahkHotkeys.StatusChanged += () => HotkeyStatusChanged?.Invoke();
         FormBorderStyle = Forms.FormBorderStyle.None;
         ShowInTaskbar = false;
         StartPosition = Forms.FormStartPosition.Manual;
@@ -2282,17 +2230,6 @@ internal sealed class TriffViewOverlayForm : Forms.Form
             if (AllowTopmost) cp.ExStyle |= TriffViewNativeMethods.WsExTopmost;
             return cp;
         }
-    }
-
-    protected override void WndProc(ref Forms.Message m)
-    {
-        if (m.Msg == TriffViewNativeMethods.WmHotkey && _hotkeys.TryGetValue(m.WParam.ToInt32(), out var command))
-        {
-            HotkeyPressed?.Invoke(command);
-            return;
-        }
-
-        base.WndProc(ref m);
     }
 
     public void SizeToVirtualDesktop()
@@ -2550,57 +2487,9 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     }
 
     public void ConfigureHotkeys(TriffViewProfile profile, IReadOnlyList<EveClientWindow> clients, bool suspended)
-    {
-        var signature = HotkeySignature(profile, clients, suspended);
-        if (string.Equals(signature, _hotkeySignature, StringComparison.Ordinal)) return;
+        => _ahkHotkeys.Configure(profile, clients, suspended);
 
-        UnregisterHotkeys();
-        _hotkeySignature = signature;
-        if (suspended) return;
-
-        var failures = new List<string>();
-        var claimedGestures = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        var directHotkeyGroups = profile.DirectHotkeys
-            .Where(binding => binding.Enabled
-                && !string.IsNullOrWhiteSpace(binding.CharacterName)
-                && binding.Gestures.Count > 0)
-            .Where(binding => clients.Any(client => string.Equals(client.CharacterName, binding.CharacterName, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(client.StableKey, binding.CharacterName, StringComparison.OrdinalIgnoreCase)))
-            .SelectMany(binding => binding.Gestures.Select(gesture => new
-            {
-                binding.CharacterName,
-                Gesture = gesture,
-            }))
-            .GroupBy(binding => binding.Gesture, StringComparer.OrdinalIgnoreCase);
-
-        foreach (var group in directHotkeyGroups)
-        {
-            var characterNames = group
-                .Select(binding => binding.CharacterName)
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .ToArray();
-            claimedGestures[group.Key] = "direct character hotkey";
-            RegisterHotkey(
-                group.Key,
-                new TriffViewHotkeyCommand(TriffViewHotkeyKind.Direct, "", "", 0, characterNames),
-                failures
-            );
-        }
-
-        foreach (var registration in TriffViewCycleHotkeyPlanner.Plan(profile, claimedGestures, failures))
-        {
-            RegisterHotkey(
-                registration.Gesture,
-                new TriffViewHotkeyCommand(
-                    TriffViewHotkeyKind.Cycle,
-                    "",
-                    registration.GroupId,
-                    registration.Direction),
-                failures);
-        }
-
-        HotkeyFailures = failures;
-    }
+    public bool ActivateFromHotkey(nint handle, bool maximize) => _ahkHotkeys.Activate(handle, maximize);
 
     public void ClearThumbnails()
     {
@@ -2621,7 +2510,7 @@ internal sealed class TriffViewOverlayForm : Forms.Form
     {
         if (disposing)
         {
-            UnregisterHotkeys();
+            _ahkHotkeys.Dispose();
             ClearThumbnails();
             _alertTimer.Dispose();
             _labelOverlay.Dispose();
@@ -3121,47 +3010,14 @@ internal sealed class TriffViewOverlayForm : Forms.Form
         return rect;
     }
 
-    private void RegisterHotkey(string gesture, TriffViewHotkeyCommand command, List<string> failures)
-    {
-        if (string.IsNullOrWhiteSpace(gesture)) return;
-
-        if (!HotkeyGesture.TryParse(gesture, out var modifiers, out var key))
-        {
-            failures.Add($"{gesture}: unsupported hotkey");
-            return;
-        }
-
-        var id = _nextHotkeyId++;
-        if (!TriffViewNativeMethods.RegisterHotKey(Handle, id, modifiers, key))
-        {
-            var error = Marshal.GetLastWin32Error();
-            failures.Add($"{gesture}: could not register hotkey (Windows error {error})");
-            return;
-        }
-
-        _hotkeys[id] = command;
-    }
-
-    private void UnregisterHotkeys()
-    {
-        foreach (var id in _hotkeys.Keys.ToArray())
-        {
-            TriffViewNativeMethods.UnregisterHotKey(Handle, id);
-        }
-
-        _hotkeys.Clear();
-        _nextHotkeyId = 3000;
-        HotkeyFailures = Array.Empty<string>();
-    }
-
     internal static string HotkeySignature(TriffViewProfile profile, IReadOnlyList<EveClientWindow> clients, bool suspended)
     {
         if (suspended) return $"suspended:{profile.Id}";
         var direct = string.Join(";", profile.DirectHotkeys.Select(binding => $"{binding.Enabled}:{binding.CharacterName}:{string.Join(",", binding.Gestures)}"));
         var cycles = string.Join(";", profile.CycleGroups.Select(group => $"{group.Enabled}:{group.Id}:{string.Join(",", group.ForwardGestures)}:{string.Join(",", group.BackwardGestures)}:{string.Join(",", group.Characters)}"));
         var characterOrder = string.Join(",", profile.CharacterOrder);
-        var clientKeys = string.Join(";", clients.Select(client => client.StableKey));
-        return $"{profile.Id}|{direct}|{cycles}|{characterOrder}|{clientKeys}";
+        var clientKeys = string.Join(";", clients.Select(client => $"{client.StableKey}:{client.Handle}"));
+        return $"{profile.Id}|{profile.HotkeysRequireEveForeground}|{direct}|{cycles}|{characterOrder}|{clientKeys}";
     }
 
     private static GraphicsPath RoundedRect(Rectangle rect, int radius)
@@ -3612,6 +3468,7 @@ internal sealed class TriffViewSettings
 
     public bool Enabled { get; set; }
     public bool HotkeysSuspended { get; set; }
+    public int HotkeySyntaxVersion { get; set; } = 1;
     public bool SettingsWindowAlwaysOnTop { get; set; } = true;
     public bool GuideCompleted { get; set; }
     public string GuideVersion { get; set; } = "";
@@ -3652,6 +3509,22 @@ internal sealed class TriffViewSettings
         var settings = JsonSerializer.Deserialize<TriffViewSettings>(json, JsonOptions)
             ?? throw new InvalidDataException("The selected file could not be read as a TriffView settings backup.");
         settings.Normalize();
+        var syntaxVersion = root["hotkeySyntaxVersion"] ?? root["HotkeySyntaxVersion"];
+        if (syntaxVersion == null || syntaxVersion.GetValue<int>() < 1)
+        {
+            foreach (var profile in settings.Profiles)
+            {
+                foreach (var binding in profile.DirectHotkeys)
+                    binding.Gestures = binding.Gestures.Select(AhkGesture.UpgradeLegacyVirtualKey).ToList();
+                foreach (var group in profile.CycleGroups)
+                {
+                    group.ForwardGestures = group.ForwardGestures.Select(AhkGesture.UpgradeLegacyVirtualKey).ToList();
+                    group.BackwardGestures = group.BackwardGestures.Select(AhkGesture.UpgradeLegacyVirtualKey).ToList();
+                }
+            }
+            settings.HotkeySyntaxVersion = 1;
+            settings.Normalize();
+        }
         return settings;
     }
 
@@ -3969,7 +3842,7 @@ internal sealed class TriffViewHotkeyBinding
     private static List<string> CleanGestureList(IEnumerable<string>? gestures)
     {
         return (gestures ?? Array.Empty<string>())
-            .SelectMany(gesture => (gesture ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            .SelectMany(AhkGesture.SplitList)
             .Select(gesture => gesture.Trim().Replace("Ctrl+", "Control+", StringComparison.OrdinalIgnoreCase))
             .Where(gesture => gesture.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -4020,7 +3893,7 @@ internal sealed class TriffViewCycleGroup
     private static List<string> CleanGestureList(IEnumerable<string>? gestures)
     {
         return (gestures ?? Array.Empty<string>())
-            .SelectMany(gesture => (gesture ?? "").Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+            .SelectMany(AhkGesture.SplitList)
             .Select(gesture => gesture.Trim().Replace("Ctrl+", "Control+", StringComparison.OrdinalIgnoreCase))
             .Where(gesture => gesture.Length > 0)
             .Distinct(StringComparer.OrdinalIgnoreCase)
@@ -4070,7 +3943,7 @@ internal static class TriffViewCycleHotkeyPlanner
         {
             foreach (var (gesture, owner) in preclaimedGestures)
             {
-                claimedGestures[gesture] = owner;
+                claimedGestures[AhkGesture.Identity(gesture)] = owner;
             }
         }
 
@@ -4097,13 +3970,14 @@ internal static class TriffViewCycleHotkeyPlanner
         var owner = $"cycle group \"{group.Name}\" {directionName}";
         foreach (var gesture in gestures)
         {
-            if (claimedGestures.TryGetValue(gesture, out var existingOwner))
+            var identity = AhkGesture.Identity(gesture);
+            if (claimedGestures.TryGetValue(identity, out var existingOwner))
             {
                 failures.Add($"{gesture}: {owner} conflicts with {existingOwner}; only the first configured binding is active");
                 continue;
             }
 
-            claimedGestures[gesture] = owner;
+            claimedGestures[identity] = owner;
             registrations.Add(new TriffViewCycleHotkeyRegistration(
                 gesture,
                 group.Id,
@@ -4120,290 +3994,6 @@ internal enum TriffViewHotkeyKind
     Cycle,
 }
 
-internal static class HotkeyGesture
-{
-    public static bool TryParse(string gesture, out uint modifiers, out uint key)
-    {
-        modifiers = 0;
-        key = 0;
-        var parts = gesture.Split('+', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries);
-        if (parts.Length == 0) return false;
-
-        foreach (var part in parts.Take(parts.Length - 1))
-        {
-            switch (part.ToLowerInvariant())
-            {
-                case "ctrl":
-                case "control":
-                    modifiers |= TriffViewNativeMethods.ModControl;
-                    break;
-                case "alt":
-                    modifiers |= TriffViewNativeMethods.ModAlt;
-                    break;
-                case "shift":
-                    modifiers |= TriffViewNativeMethods.ModShift;
-                    break;
-                case "win":
-                case "windows":
-                    modifiers |= TriffViewNativeMethods.ModWin;
-                    break;
-                case "norepeat":
-                    modifiers |= TriffViewNativeMethods.ModNoRepeat;
-                    break;
-                default:
-                    return false;
-            }
-        }
-
-        var keyName = parts[^1].Trim();
-        switch (keyName.ToLowerInvariant())
-        {
-            case "`":
-            case "~":
-            case "grave":
-            case "backquote":
-            case "tilde":
-            case "oem3":
-            case "oemtilde":
-                key = (uint)Forms.Keys.Oemtilde;
-                return true;
-            case "plus":
-                key = (uint)Forms.Keys.Oemplus;
-                return true;
-            case "minus":
-                key = (uint)Forms.Keys.OemMinus;
-                return true;
-            case "comma":
-                key = (uint)Forms.Keys.Oemcomma;
-                return true;
-            case "period":
-                key = (uint)Forms.Keys.OemPeriod;
-                return true;
-            case "[":
-            case "openbracket":
-            case "openbrackets":
-            case "leftbracket":
-            case "leftbrackets":
-            case "oemopenbrackets":
-                key = (uint)Forms.Keys.OemOpenBrackets;
-                return true;
-            case "]":
-            case "closebracket":
-            case "closebrackets":
-            case "rightbracket":
-            case "rightbrackets":
-            case "oemclosebrackets":
-                key = (uint)Forms.Keys.OemCloseBrackets;
-                return true;
-            case "cancel":
-                key = 0x03;
-                return true;
-            case "pause":
-                key = (uint)Forms.Keys.Pause;
-                return true;
-            case "capslock":
-            case "capital":
-                key = (uint)Forms.Keys.CapsLock;
-                return true;
-            case "printscreen":
-            case "snapshot":
-                key = (uint)Forms.Keys.PrintScreen;
-                return true;
-            case "apps":
-            case "menu":
-            case "contextmenu":
-                key = (uint)Forms.Keys.Apps;
-                return true;
-            case "sleep":
-                key = (uint)Forms.Keys.Sleep;
-                return true;
-            case "numpadmultiply":
-            case "multiply":
-                key = (uint)Forms.Keys.Multiply;
-                return true;
-            case "numpadadd":
-            case "add":
-                key = (uint)Forms.Keys.Add;
-                return true;
-            case "numpadseparator":
-            case "separator":
-                key = (uint)Forms.Keys.Separator;
-                return true;
-            case "numpadsubtract":
-            case "subtract":
-                key = (uint)Forms.Keys.Subtract;
-                return true;
-            case "numpaddecimal":
-            case "decimal":
-                key = (uint)Forms.Keys.Decimal;
-                return true;
-            case "numpaddivide":
-            case "divide":
-                key = (uint)Forms.Keys.Divide;
-                return true;
-            case "numlock":
-                key = (uint)Forms.Keys.NumLock;
-                return true;
-            case "scrolllock":
-                key = (uint)Forms.Keys.Scroll;
-                return true;
-            case "browserback":
-                key = (uint)Forms.Keys.BrowserBack;
-                return true;
-            case "browserforward":
-                key = (uint)Forms.Keys.BrowserForward;
-                return true;
-            case "browserrefresh":
-                key = (uint)Forms.Keys.BrowserRefresh;
-                return true;
-            case "browserstop":
-                key = (uint)Forms.Keys.BrowserStop;
-                return true;
-            case "browsersearch":
-                key = (uint)Forms.Keys.BrowserSearch;
-                return true;
-            case "browserfavorites":
-                key = (uint)Forms.Keys.BrowserFavorites;
-                return true;
-            case "browserhome":
-                key = (uint)Forms.Keys.BrowserHome;
-                return true;
-            case "volumemute":
-                key = (uint)Forms.Keys.VolumeMute;
-                return true;
-            case "volumedown":
-                key = (uint)Forms.Keys.VolumeDown;
-                return true;
-            case "volumeup":
-                key = (uint)Forms.Keys.VolumeUp;
-                return true;
-            case "medianexttrack":
-                key = (uint)Forms.Keys.MediaNextTrack;
-                return true;
-            case "mediaprevioustrack":
-                key = (uint)Forms.Keys.MediaPreviousTrack;
-                return true;
-            case "mediastop":
-                key = (uint)Forms.Keys.MediaStop;
-                return true;
-            case "mediaplaypause":
-                key = (uint)Forms.Keys.MediaPlayPause;
-                return true;
-            case "launchmail":
-                key = (uint)Forms.Keys.LaunchMail;
-                return true;
-            case "selectmedia":
-                key = (uint)Forms.Keys.SelectMedia;
-                return true;
-            case "launchapplication1":
-                key = (uint)Forms.Keys.LaunchApplication1;
-                return true;
-            case "launchapplication2":
-                key = (uint)Forms.Keys.LaunchApplication2;
-                return true;
-            case ";":
-            case "semicolon":
-            case "oemsemicolon":
-                key = (uint)Forms.Keys.OemSemicolon;
-                return true;
-            case "/":
-            case "slash":
-            case "question":
-            case "oemquestion":
-                key = (uint)Forms.Keys.OemQuestion;
-                return true;
-            case "\\":
-            case "backslash":
-            case "pipe":
-            case "oempipe":
-                key = (uint)Forms.Keys.OemPipe;
-                return true;
-            case "'":
-            case "\"":
-            case "quote":
-            case "quotes":
-            case "apostrophe":
-            case "oemquotes":
-                key = (uint)Forms.Keys.OemQuotes;
-                return true;
-            case "oem8":
-                key = (uint)Forms.Keys.Oem8;
-                return true;
-            case "oem102":
-            case "oembackslash":
-                key = (uint)Forms.Keys.OemBackslash;
-                return true;
-        }
-
-        if (TryParseVirtualKeyLiteral(keyName, out key)) return true;
-
-        if (keyName.Length == 1)
-        {
-            var c = char.ToUpperInvariant(keyName[0]);
-            if (c is >= 'A' and <= 'Z' or >= '0' and <= '9')
-            {
-                key = (uint)c;
-                return true;
-            }
-        }
-
-        if (Enum.TryParse<Forms.Keys>(keyName, true, out var parsed))
-        {
-            key = (uint)parsed;
-            return key != 0;
-        }
-
-        return false;
-    }
-
-    private static bool TryParseVirtualKeyLiteral(string keyName, out uint key)
-    {
-        key = 0;
-        var value = keyName.Trim();
-        var hasVirtualKeyPrefix = false;
-        var isHex = false;
-
-        if (value.StartsWith("VK_", StringComparison.OrdinalIgnoreCase))
-        {
-            value = value[3..];
-            hasVirtualKeyPrefix = true;
-        }
-        else if (value.StartsWith("VK", StringComparison.OrdinalIgnoreCase) && value.Length > 2)
-        {
-            value = value[2..];
-            hasVirtualKeyPrefix = true;
-        }
-
-        if (value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
-        {
-            value = value[2..];
-            hasVirtualKeyPrefix = true;
-            isHex = true;
-        }
-
-        if (!hasVirtualKeyPrefix || value.Length == 0) return false;
-        if (!uint.TryParse(
-                value,
-                isHex || HasHexLetter(value) ? System.Globalization.NumberStyles.HexNumber : System.Globalization.NumberStyles.Integer,
-                System.Globalization.CultureInfo.InvariantCulture,
-                out var parsed)) return false;
-
-        if (parsed == 0 || parsed > 0xFE) return false;
-        key = parsed;
-        return true;
-    }
-
-    private static bool HasHexLetter(string value)
-    {
-        foreach (var c in value)
-        {
-            if (c is >= 'A' and <= 'F' or >= 'a' and <= 'f') return true;
-        }
-
-        return false;
-    }
-}
-
 internal static class TriffViewNativeMethods
 {
     public const int WsExTopmost = 0x00000008;
@@ -4413,7 +4003,6 @@ internal static class TriffViewNativeMethods
     public const int WsExLayered = 0x00080000;
     public const int WmClose = 0x0010;
     public const int WmNcHitTest = 0x0084;
-    public const int WmHotkey = 0x0312;
     public const int WmSysCommand = 0x0112;
     public static readonly nint ScMinimize = new(0xF020);
     public static readonly nint HtTransparent = new(-1);
@@ -4424,11 +4013,6 @@ internal static class TriffViewNativeMethods
     public const uint SwpNoMove = 0x0002;
     public const uint SwpNoActivate = 0x0010;
     public const uint SwpShowWindow = 0x0040;
-    public const uint ModAlt = 0x0001;
-    public const uint ModControl = 0x0002;
-    public const uint ModShift = 0x0004;
-    public const uint ModWin = 0x0008;
-    public const uint ModNoRepeat = 0x4000;
     public const int DwmTnpRectDestination = 0x00000001;
     public const int DwmTnpRectSource = 0x00000002;
     public const int DwmTnpOpacity = 0x00000004;
@@ -4529,11 +4113,7 @@ internal static class TriffViewNativeMethods
     [DllImport("user32.dll", SetLastError = true)]
     public static extern nint SendMessage(nint hwnd, int message, nint wParam, nint lParam);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool RegisterHotKey(nint hwnd, int id, uint fsModifiers, uint vk);
 
-    [DllImport("user32.dll", SetLastError = true)]
-    public static extern bool UnregisterHotKey(nint hwnd, int id);
 
     [DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int virtualKey);

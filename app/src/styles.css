@@ -3155,6 +3155,22 @@ button:disabled {
   background: rgba(var(--tv-shadow-rgb), 0.42);
 }
 
+.triffview-hotkey-backdrop {
+  position: fixed;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.triffview-hotkey-backdrop > .triffview-hotkey-modal {
+  display: flex;
+  flex-direction: column;
+}
+
+.triffview-hotkey-backdrop .triffview-hotkey-modal > header,
+.triffview-hotkey-editor-help {
+  flex-shrink: 0;
+}
+
 .triffview-hotkey-modal {
   width: min(520px, calc(100% - 42px));
   max-height: calc(100% - 42px);
@@ -3188,11 +3204,26 @@ button:disabled {
 
 .triffview-hotkey-editor-list {
   display: flex;
+  min-height: 0;
   max-height: 320px;
   flex-direction: column;
   gap: 6px;
   overflow: auto;
+  overscroll-behavior: contain;
   padding: 12px;
+}
+
+.triffview-hotkey-editor-help {
+  padding: 0 12px 12px;
+}
+
+.triffview-hotkey-editor-help p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.triffview-hotkey-editor-help p + p {
+  margin-top: 8px;
 }
 
 .triffview-hotkey-editor-row {

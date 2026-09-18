@@ -802,7 +802,7 @@ public sealed class TriffAlertsService : IDisposable
         }
     }
 
-    private TriffAlertEvent? ParseLine(string characterName, string rawLine)
+    internal TriffAlertEvent? ParseLine(string characterName, string rawLine)
     {
         var line = rawLine.Trim();
         var lower = line.ToLowerInvariant();
@@ -821,6 +821,7 @@ public sealed class TriffAlertsService : IDisposable
 
         if (lower.Contains("warp scramble attempt") || lower.Contains("warp disruption attempt") || lower.Contains("warp disruption zone"))
         {
+            if (!IsIncomingWarpDisruptionLine(line)) return null;
             return BuildEvent("warp_scramble", characterName, ExtractSource(line), "Warp disruption detected");
         }
 
@@ -950,6 +951,19 @@ public sealed class TriffAlertsService : IDisposable
         var match = Regex.Match(clean, @"\]\s*\(combat\)\s*(?<source>.+?)\s+misses you", RegexOptions.IgnoreCase);
         source = match.Success ? match.Groups["source"].Value.Trim() : ExtractSource(line);
         return true;
+    }
+
+    private static bool IsIncomingWarpDisruptionLine(string line)
+    {
+        var clean = StripMarkup(line);
+        const RegexOptions options = RegexOptions.IgnoreCase | RegexOptions.CultureInvariant;
+
+        // Fleet logs also contain attempts against other pilots and our outgoing attempts.
+        // EVE identifies the listener as the target with "to you!", not a named pilot.
+        return Regex.IsMatch(clean,
+            @"^\(combat\)\s+Warp (?:scramble|disruption) attempt\s+from\s+.+\s+to\s+you[!.]?$", options)
+            || Regex.IsMatch(clean,
+                @"^\(notify\)\s+You are within a warp disruption zone\b", options);
     }
 
     private static string ExtractSource(string line)

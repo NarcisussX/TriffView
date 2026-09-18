@@ -9,10 +9,10 @@
     <AssemblyName>TriffView</AssemblyName>
     <RootNamespace>TriffView</RootNamespace>
     <ApplicationIcon>Assets\TriffView.ico</ApplicationIcon>
-    <Version>2.0.5</Version>
-    <AssemblyVersion>2.0.5.0</AssemblyVersion>
-    <FileVersion>2.0.5.0</FileVersion>
-    <InformationalVersion>2.0.5</InformationalVersion>
+    <Version>2.1.0</Version>
+    <AssemblyVersion>2.1.0.0</AssemblyVersion>
+    <FileVersion>2.1.0.0</FileVersion>
+    <InformationalVersion>2.1.0</InformationalVersion>
     <IncludeSourceRevisionInInformationalVersion>false</IncludeSourceRevisionInInformationalVersion>
     <PackageLicenseExpression>GPL-3.0-only</PackageLicenseExpression>
   </PropertyGroup>
@@ -35,6 +35,9 @@
   </ItemGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="Hotkeys\TriffViewHotkeys.ahk" LogicalName="TriffView.Hotkeys.TriffViewHotkeys.ahk" />
+    <EmbeddedResource Include="Hotkeys\EVE-X-LICENSE.txt" LogicalName="TriffView.Hotkeys.EVE-X-LICENSE.txt" />
+    <EmbeddedResource Include="Hotkeys\Runtime\*" LogicalName="TriffView.Hotkeys.%(Filename)%(Extension)" />
     <Resource Include="Assets\TriffView.ico" />
     <EmbeddedResource Include="Assets\overlay-dist.zip"
                       Condition="Exists('Assets\overlay-dist.zip')"

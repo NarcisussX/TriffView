@@ -174,4 +174,23 @@ EVE Online, EVE, and related names, marks, and imagery are trademarks or intelle
 
 ## Behavioral References
 
-EVE-O Preview, EVE-X Preview, EVE-APM, Nicotine, and related tools were used as behavioral references while designing TriffView features. TriffView does not intentionally include copied source modules from those projects.
+EVE-O Preview, EVE-X Preview, EVE-APM, Nicotine, and related tools were used as behavioral references while designing TriffView features.
+
+### EVE-X Preview hotkey activation
+
+The registration and foreground activation sequence in `native/Hotkeys/TriffViewHotkeys.ahk` is adapted from EVE-X Preview's `src/Main_Class.ahk` at commit `b5902250f8189f6b3d345b7ba1ac998de6d6b55b`.
+
+- Copyright (c) 2024 g0nzo83
+- License: MIT; complete notice in `native/Hotkeys/EVE-X-LICENSE.txt`, also embedded and extracted with the helper
+- Source: https://github.com/g0nzo83/EVE-X-Preview
+
+### AutoHotkey v2
+
+TriffView bundles the unmodified AutoHotkey v2.0.28 x64 interpreter as a separate process. No separate installation is required.
+
+- Runtime: `native/Hotkeys/Runtime/AutoHotkey64.exe`
+- License: GNU GPL version 2; complete upstream license in `native/Hotkeys/Runtime/license.txt`
+- Corresponding source archive: `native/Hotkeys/Runtime/AutoHotkey-source.zip`
+- Source and release: https://github.com/AutoHotkey/AutoHotkey/releases/tag/v2.0.28
+
+The runtime, license, corresponding source archive, and EVE-X notice are embedded in both portable and single-file TriffView builds and extracted together. Preserve these files when redistributing the helper. Version, origin, and hashes are recorded in `native/Hotkeys/README.md`.

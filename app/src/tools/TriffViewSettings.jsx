@@ -20,7 +20,7 @@ const EMPTY_STATE = {
 
 const ALERT_EVENT_DEFS = [
   { id: "attack", label: "Attack", description: "Incoming damage and hostile misses against the listener character." },
-  { id: "warp_scramble", label: "Warp scramble", description: "Warp disruption attempts and disruption zone messages." },
+  { id: "warp_scramble", label: "Warp scramble", description: "Scramble or disruption attempts against this character, and their own disruption zone warnings." },
   { id: "decloak", label: "Decloak", description: "Cloak deactivation notifications from proximity or other causes." },
   { id: "fleet_invite", label: "Fleet invite", description: "Fleet invitation prompts." },
   { id: "convo_request", label: "Convo request", description: "Conversation invitation prompts." },
@@ -780,13 +780,13 @@ function HotkeySummaryButton({ label, gestures, onOpen }) {
   );
 }
 
-function HotkeyEditorModal({ editor, gestures, recording, onRecord, onClear, onClose }) {
+function HotkeyEditorModal({ editor, gestures, recording, onRecord, onEdit, onClear, onClose }) {
   if (!editor) return null;
   const cleanGestures = splitGestures(gestures);
   const rows = [...cleanGestures, ""];
 
   return (
-    <div className="triffview-modal-backdrop" role="presentation" onMouseDown={(event) => {
+    <div className="triffview-modal-backdrop triffview-hotkey-backdrop" role="presentation" onMouseDown={(event) => {
       if (event.target === event.currentTarget) onClose();
     }}>
       <section className="triffview-hotkey-modal" role="dialog" aria-modal="true" aria-label={editor.label}>
@@ -799,7 +799,7 @@ function HotkeyEditorModal({ editor, gestures, recording, onRecord, onClear, onC
             Close
           </button>
         </header>
-        <div className="triffview-hotkey-editor-list">
+        <div className="triffview-hotkey-editor-list" data-hud-scroll>
           {rows.map((gesture, index) => {
             const isRecording = recording
               && recording.type === editor.type
@@ -808,9 +808,20 @@ function HotkeyEditorModal({ editor, gestures, recording, onRecord, onClear, onC
               && recording.index === index;
             return (
               <div className="triffview-hotkey-editor-row" key={`${gesture || "empty"}-${index}`}>
-                <span className={gesture ? "triffview-gesture-value" : "triffview-gesture-value is-empty"}>
-                  {isRecording ? "Press key combo..." : gesture || "Unassigned"}
-                </span>
+                <input
+                  type="text"
+                  className="triffview-gesture-value"
+                  aria-label={`Hotkey ${index + 1}`}
+                  defaultValue={gesture}
+                  disabled={Boolean(isRecording)}
+                  placeholder={isRecording ? "Press key combo..." : "e.g. *F14 or ^F13"}
+                  onBlur={(event) => {
+                    if (event.target.value.trim() !== gesture) onEdit(index, event.target.value.trim());
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") { event.preventDefault(); event.currentTarget.blur(); }
+                  }}
+                />
                 <button type="button" onClick={() => onRecord(index)}>
                   {isRecording ? "Cancel" : "Record"}
                 </button>
@@ -821,6 +832,10 @@ function HotkeyEditorModal({ editor, gestures, recording, onRecord, onClear, onC
             );
           })}
         </div>
+        <footer className="triffview-hotkey-editor-help">
+          <p>Add <code>*</code> to allow held modifiers: <code>*F14</code> works while Ctrl or Shift is held; <code>F14</code> does not.</p>
+          <p>Press Enter or leave the field to save.</p>
+        </footer>
       </section>
     </div>
   );
@@ -2081,31 +2096,36 @@ function TriffViewSettings({ open = true }) {
         </div>
         </>
         ) : null}
-        <HotkeyEditorModal
-          editor={hotkeyEditor}
-          gestures={editorGestures()}
-          recording={recording}
-          onRecord={(index) => {
-            if (!hotkeyEditor) return;
-            startRecording({
-              type: hotkeyEditor.type,
-              id: hotkeyEditor.id,
-              field: hotkeyEditor.field,
-              index,
-            });
-          }}
-          onClear={(index) => {
-            const next = editorGestures().filter((_, gestureIndex) => gestureIndex !== index);
-            updateEditorGestures(next);
-            if (recording?.index === index) setRecording(null);
-          }}
-          onClose={() => {
-            setHotkeyEditor(null);
-            setRecording(null);
-          }}
-        />
         </div>
       </section>
+      <HotkeyEditorModal
+        editor={hotkeyEditor}
+        gestures={editorGestures()}
+        recording={recording}
+        onEdit={(index, gesture) => {
+          const next = [...editorGestures()];
+          next[index] = gesture;
+          updateEditorGestures(next.filter(Boolean));
+        }}
+        onRecord={(index) => {
+          if (!hotkeyEditor) return;
+          startRecording({
+            type: hotkeyEditor.type,
+            id: hotkeyEditor.id,
+            field: hotkeyEditor.field,
+            index,
+          });
+        }}
+        onClear={(index) => {
+          const next = editorGestures().filter((_, gestureIndex) => gestureIndex !== index);
+          updateEditorGestures(next);
+          if (recording?.index === index) setRecording(null);
+        }}
+        onClose={() => {
+          setHotkeyEditor(null);
+          setRecording(null);
+        }}
+      />
     </div>
   );
 }

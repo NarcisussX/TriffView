@@ -491,9 +491,16 @@ public partial class MainWindow : Window
 
     private static string? FindOverlayDistFolder()
     {
+#if DEBUG
         return FindLooseOverlayDistFolder() ?? ExtractEmbeddedOverlayDist();
+#else
+        // Published builds must keep their own UI assets. A shared app/dist can be
+        // rebuilt while this process is running, removing lazy-loaded page chunks.
+        return ExtractEmbeddedOverlayDist();
+#endif
     }
 
+#if DEBUG
     private static string? FindLooseOverlayDistFolder()
     {
         var current = new DirectoryInfo(AppContext.BaseDirectory);
@@ -507,6 +514,7 @@ public partial class MainWindow : Window
 
         return null;
     }
+#endif
 
     private static string? ExtractEmbeddedOverlayDist()
     {

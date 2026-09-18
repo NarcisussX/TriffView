@@ -70,6 +70,8 @@ The result is a preview tool that aims to feel fast, stay smooth during rapid sw
 
 ## Profile First
 
+Window-switching hotkeys use the bundled AutoHotkey v2 runtime. The hotkey editor accepts AHK expressions directly: `F14` is an ordinary binding, while `*F14` also works with modifiers held. Existing `Control+F14`-style bindings remain accepted. Details and current validation status are in [the hotkey implementation notes](native/Hotkeys/README.md).
+
 TriffView profiles let different play styles have different layouts.
 
 Keep one profile for fleets, one for market or industry characters, one for scouts, one for testing, or one for every group you fly. Preview positions, labels, hotkeys, cycle groups, colors, client behavior, and imported layouts can all live with the profile they belong to. Switching between cycle groups or profiles can be done hot, with 2 clicks. 
@@ -90,11 +92,11 @@ Third-party dependency, font, WebView2, and EVE/CCP trademark notices are listed
 
 ## Release Verification
 
-Current Windows release: `v2.0.5`
+Current Windows release: `v2.1.0`
 
 - File: `TriffView.exe`
-- Size: `165,348,752 bytes` (`157.69 MiB`)
-- SHA-256: `3BDE32C5CFF1E79945DA97BD6204F89158A10AFC1659A2ECD06AD82E36F6CA7E`
+- Size: `168,551,824 bytes` (`160.74 MiB`)
+- SHA-256: `83E617BB8665D45DA27A2AA40A6AEB828CF458818787CC05FB6DDAC54B4A2B26`
 
 The release executable is Authenticode signed by Cooper Broderick and timestamped through Microsoft's timestamp service. The download also includes `TriffView.exe.sha256.txt` for verification.
 
